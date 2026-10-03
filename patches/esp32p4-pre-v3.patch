@@ -1624,75 +1624,54 @@ index 00000000..9a5970bc
 + */
 +_rom_chip_id = 0x4fc00010;
 +_rom_eco_version = 0x4fc00014;
-diff --git a/esp-sync/Cargo.toml b/esp-sync/Cargo.toml
-index d770bf52..8feb3935 100644
---- a/esp-sync/Cargo.toml
-+++ b/esp-sync/Cargo.toml
-@@ -38,6 +38,7 @@ xtensa-lx        = { version = "0.13.0", path = "../xtensa-lx" }
- 
- [build-dependencies]
- esp-metadata-generated = { version = "0.4.0", path = "../esp-metadata-generated", features = ["build-script"] }
-+esp-config = { version = "0.7.0", path = "../esp-config", features = ["build"] }
- 
- [features]
- #! ### Chip Support Feature Flags
 diff --git a/esp-sync/build.rs b/esp-sync/build.rs
-index e55f71a4..1cee714e 100644
+index e55f71a46..1b4b5efee 100644
 --- a/esp-sync/build.rs
 +++ b/esp-sync/build.rs
-@@ -1,9 +1,31 @@
- use std::error::Error;
- 
-+use esp_config::generate_config_from_yaml_definition;
-+
- fn main() -> Result<(), Box<dyn Error>> {
-     // Define all necessary configuration symbols for the configured device:
+@@ -5,5 +5,43 @@ fn main() -> Result<(), Box<dyn Error>> {
      let chip = esp_metadata_generated::Chip::from_cargo_feature()?;
      chip.define_cfgs();
  
-+    // Derive `esp32p4_rev_lt_v3` from the configured minimum chip revision: pre-v3.0
-+    // ESP32-P4 lacks the `mintthresh` CSR the Zcmp critical-section workaround writes
-+    // (0x347 traps). Compile-time, since the workaround runs in hot/early paths.
-+    println!("cargo:rerun-if-changed=./esp_config.yml");
-+    let cfg_yaml = std::fs::read_to_string("./esp_config.yml")
-+        .expect("Failed to read esp_config.yml for esp-sync");
-+    let cfg = generate_config_from_yaml_definition(&cfg_yaml, true, true, Some(chip)).unwrap();
-+
 +    println!("cargo:rustc-check-cfg=cfg(esp32p4_rev_lt_v3)");
 +    if chip.name() == "esp32p4" {
-+        let min_rev = cfg
-+            .iter()
-+            .find(|(k, _)| k.to_ascii_lowercase().ends_with("min_chip_revision"))
-+            .map(|(_, v)| v.as_integer())
-+            .unwrap_or(0);
-+        if min_rev < 300 {
++        // Derive `esp32p4_rev_lt_v3` from the configured minimum chip revision: pre-v3.0
++        // ESP32-P4 lacks the `mintthresh` CSR the Zcmp critical-section workaround writes
++        // (0x347 traps). Compile-time, since the workaround runs in hot/early paths.
++        println!("cargo:rerun-if-env-changed=ESP_HAL_CONFIG_MIN_CHIP_REVISION");
++        let minimum_revision = match std::env::var("ESP_HAL_CONFIG_MIN_CHIP_REVISION") {
++            Ok(value) => {
++                let parsed: i128 = if let Some(stripped) = value.strip_prefix("0x") {
++                    i128::from_str_radix(stripped, 16)
++                } else if let Some(stripped) = value.strip_prefix("0o") {
++                    i128::from_str_radix(stripped, 8)
++                } else if let Some(stripped) = value.strip_prefix("0b") {
++                    i128::from_str_radix(stripped, 2)
++                } else {
++                    value.parse::<i128>()
++                }
++                .map_err(|error| {
++                    std::io::Error::new(
++                        std::io::ErrorKind::InvalidInput,
++                        format!("Invalid ESP_HAL_CONFIG_MIN_CHIP_REVISION: {error}"),
++                    )
++                })?;
++                u16::try_from(parsed).map_err(|_| {
++                    std::io::Error::new(
++                        std::io::ErrorKind::InvalidInput,
++                        "ESP_HAL_CONFIG_MIN_CHIP_REVISION must fit in u16",
++                    )
++                })?
++            }
++            Err(std::env::VarError::NotPresent) => 300,
++            Err(error) => return Err(error.into()),
++        };
++        if minimum_revision < 300 {
 +            println!("cargo:rustc-cfg=esp32p4_rev_lt_v3");
 +        }
 +    }
 +
      Ok(())
  }
-diff --git a/esp-sync/esp_config.yml b/esp-sync/esp_config.yml
-new file mode 100644
-index 00000000..9eed1eff
---- /dev/null
-+++ b/esp-sync/esp_config.yml
-@@ -0,0 +1,15 @@
-+crate: esp-sync
-+
-+options:
-+  - name: min-chip-revision
-+    description: "The minimum chip revision the application targets, in format:
-+      major * 100 + minor. On ESP32-P4, revisions below v3.0 (< 300) lack the `mintthresh`
-+      CSR (writing 0x347 traps illegal-instruction), so the Zcmp critical-section workaround
-+      is disabled there. Defaults to 300 (v3.0) on ESP32-P4 — set it to your silicon
-+      revision (e.g. 100 for v1.0) on older parts. Keep in sync with the esp-hal option of
-+      the same name. Mirrors ESP-IDF `CONFIG_ESP32P4_SELECTS_REV_LESS_V3`."
-+    default:
-+      - value: 300
-+        if: 'chip == "esp32p4"'
-+      - value: 0
-+    active: 'chip == "esp32p4"'
 diff --git a/esp-sync/src/raw.rs b/esp-sync/src/raw.rs
 index 778caabd..79508572 100644
 --- a/esp-sync/src/raw.rs

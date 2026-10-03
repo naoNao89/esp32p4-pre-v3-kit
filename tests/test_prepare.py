@@ -1,3 +1,4 @@
+import sys
 import hashlib
 import json
 import os
@@ -108,7 +109,7 @@ class PrepareTests(unittest.TestCase):
         if source_script.is_file():
             shutil.copy2(source_script, self.kit / "prepare.py")
         return subprocess.run(
-            ["python3", str(self.kit / "prepare.py"), str(destination)],
+            [sys.executable, str(self.kit / "prepare.py"), str(destination)],
             cwd=self.kit,
             capture_output=True,
             text=True,
@@ -259,6 +260,73 @@ class PrepareTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(destination.exists())
 
+class XTaskPrepareTests(PrepareTests):
+    def setUp(self):
+        super().setUp()
+        self.xtask_target = self.root / "xtask_target"
+        subprocess.run(
+            ["cargo", "build", "--bin", "xtask"],
+            cwd=KIT_ROOT,
+            env={**os.environ, "CARGO_TARGET_DIR": str(self.xtask_target)},
+            check=True,
+            capture_output=True,
+        )
+        self.xtask_bin = self.xtask_target / "debug" / "xtask"
 
+    def test_xtask_prepare_with_custom_python_executable(self):
+        if sys.platform == "win32":
+            self.skipTest("Unix-specific wrapper test")
+
+        wrapper = self.root / "custom_python.sh"
+        wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} \"$@\"\n")
+        wrapper.chmod(0o755)
+
+        # Clear PATH of python3 to ensure xtask MUST use PYTHON
+        env = os.environ.copy()
+        env["PYTHON"] = str(wrapper)
+        env["CARGO_MANIFEST_DIR"] = str(self.kit)
+        
+        # Create a new isolated bin directory with only git, to prove python3 is absent
+        isolated_bin = self.root / "isolated_bin"
+        isolated_bin.mkdir()
+        git_path = shutil.which("git")
+        if git_path:
+            (isolated_bin / "git").symlink_to(git_path)
+        env["PATH"] = str(isolated_bin)
+        
+        for filename in ("Cargo.toml", "xtask.rs", "prepare.py"):
+            shutil.copy2(KIT_ROOT / filename, self.kit / filename)
+            
+        destination = self.root / "prepared"
+        
+        result = subprocess.run(
+            [str(self.xtask_bin), "prepare", str(destination)],
+            env=env,
+            cwd=self.kit,
+            capture_output=True,
+            text=True
+        )
+        self.assertEqual(result.returncode, 0, f"xtask prepare failed: {result.stderr}")
+        self.assertTrue(destination.is_dir(), "Destination directory was not created")
+        self.assertTrue((destination / "upstream" / "esp-hal" / "Cargo.toml").exists(), "esp-hal package not found in destination")
+    def test_xtask_prepare_yields_real_nonzero_error_on_failure(self):
+        # Test that xtask propagates failure
+        destination = self.root / "prepared"
+        
+        # Create the destination ahead of time so prepare.py fails
+        destination.mkdir()
+        
+        env = os.environ.copy()
+        
+        result = subprocess.run(
+            [str(self.xtask_bin), "prepare", str(destination)],
+            env=env,
+            cwd=self.kit,
+            capture_output=True,
+            text=True
+        )
+        
+        self.assertNotEqual(result.returncode, 0, f"xtask prepare should have failed due to existing destination, but succeeded. STDOUT: {result.stdout}")
+        self.assertIn("destination already exists", result.stderr, "Did not get expected prepare.py error")
 if __name__ == "__main__":
     unittest.main()

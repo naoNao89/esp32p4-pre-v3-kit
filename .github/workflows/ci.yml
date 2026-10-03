@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    name: Checks and Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt,clippy,llvm-tools-preview
+          rustup default 1.95.0
+          rustup target add riscv32imafc-unknown-none-elf
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Cargo fmt
+        run: cargo xtask fmt-packages -- --check
+
+      - name: Clippy
+        run: cargo xtask lint-packages
+
+      - name: Host Tests
+        run: cargo xtask host-tests
+
+      - name: Test Consumer 103
+        run: python3 tests/check_consumer.py --revision 103 --destination target/consumer-103
+
+      - name: Test Consumer 300
+        run: python3 tests/check_consumer.py --revision 300 --destination target/consumer-300
