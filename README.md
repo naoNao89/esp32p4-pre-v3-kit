@@ -160,3 +160,5 @@ This is a bounded validation block. External GPIO/UART routing and signals, abso
 - [x] scoped selected ROM delay verified
 - [ ] unverified external UART routing/baud absolute calibration
 - [ ] absolute full delay calibration
+
+Based on [esp-rs/esp-hal](https://github.com/esp-rs/esp-hal). Pre-v3 CLIC and CPLL changes are credited to [hatomist](https://github.com/hatomist/esp-hal); the UART and ROM-table changes are in this kit's patch. See the [upstream UART example at the pinned base revision](https://github.com/esp-rs/esp-hal/blob/e02f3613e9f9ba1ce00070eb387e3bf4fde2267b/examples/interrupt/uart/src/main.rs). The source is provided under the included [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) license. For ROM table derivations, see [PROVENANCE.md](PROVENANCE.md).
