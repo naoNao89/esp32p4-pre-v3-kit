@@ -1,0 +1,1728 @@
+diff --git a/esp-hal/build.rs b/esp-hal/build.rs
+index 538295b3..5bd5ddc7 100644
+--- a/esp-hal/build.rs
++++ b/esp-hal/build.rs
+@@ -57,6 +57,23 @@ fn main() -> Result<(), Box<dyn Error>> {
+         .expect("Failed to read esp_config.yml for esp-hal");
+     let cfg = generate_config_from_yaml_definition(&cfg_yaml, true, true, Some(chip)).unwrap();
+ 
++    // Pre-v3.0 ESP32-P4 silicon uses a non-standard CLIC (memory-mapped interrupt
++    // threshold, no `mintthresh` CSR, `mintstatus` at 0x346). Derive a cfg from the
++    // configured minimum chip revision so the relevant paths are selected at compile time
++    // — runtime detection can't be used here, as the wrong CSR access traps and the chip
++    // revision isn't known until after init.
++    println!("cargo:rustc-check-cfg=cfg(esp32p4_rev_lt_v3)");
++    if chip.name() == "esp32p4" {
++        let min_rev = cfg
++            .iter()
++            .find(|(k, _)| k.to_ascii_lowercase().ends_with("min_chip_revision"))
++            .map(|(_, v)| v.as_integer())
++            .unwrap_or(0);
++        if min_rev < 300 {
++            println!("cargo:rustc-cfg=esp32p4_rev_lt_v3");
++        }
++    }
++
+     // RISC-V and Xtensa devices each require some special handling and processing
+     // of linker scripts:
+ 
+diff --git a/esp-hal/esp_config.yml b/esp-hal/esp_config.yml
+index 72189935..c0eb021e 100644
+--- a/esp-hal/esp_config.yml
++++ b/esp-hal/esp_config.yml
+@@ -185,8 +185,14 @@ options:
+     active: 'chip == "esp32p4"'
+ 
+   - name: min-chip-revision
+-    description: "The minimum chip revision required for the application to run, in format: major * 100 + minor."
+-    default:
++    description: "The minimum chip revision required for the application to run, in format:
++      major * 100 + minor. On ESP32-P4 this also selects the CLIC variant: revisions below
++      v3.0 (< 300) use the non-standard CLIC (memory-mapped interrupt threshold, mintstatus
++      at 0x346); v3.0+ uses the standard CLIC. Defaults to 300 (v3.0) on ESP32-P4 — set it
++      to your silicon revision (e.g. 100 for v1.0, 103 for v1.3) on older parts."
++    default:
++      - value: 300
++        if: 'chip == "esp32p4"'
+       - value: 0
+ 
+   - name: use_rwdata_ld_hook
+diff --git a/esp-hal/src/clock/mod.rs b/esp-hal/src/clock/mod.rs
+index 98f0b694..29bf420a 100644
+--- a/esp-hal/src/clock/mod.rs
++++ b/esp-hal/src/clock/mod.rs
+@@ -104,7 +104,7 @@ impl CpuClock {
+             } else if #[cfg(esp32h2)] {
+                 Self::_96MHz
+             } else if #[cfg(esp32p4)] {
+-                Self::_400MHz
++                Self::MAX
+             } else {
+                 Self::_240MHz
+             }
+diff --git a/esp-hal/src/interrupt/riscv.rs b/esp-hal/src/interrupt/riscv.rs
+index 3a2e0265..5cbc0c76 100644
+--- a/esp-hal/src/interrupt/riscv.rs
++++ b/esp-hal/src/interrupt/riscv.rs
+@@ -593,6 +593,17 @@ pub(crate) mod rt {
+ 
+         cfg_if::cfg_if! {
+             if #[cfg(interrupt_controller = "clic")] {
++                // On the pre-v3 ESP32-P4 non-standard CLIC, `mintstatus.mil` (CSR 0x346) does
++                // not match the slot's `ctl` level encoding, so `current_runlevel()` is
++                // unreliable; since `should_handle()` requires `cpu_interrupt.level() ==
++                // runlevel`, a wrong runlevel drops the interrupt and a level-triggered source
++                // is never cleared (interrupt storm). Dispatch off the serviced interrupt's own
++                // ctl-derived level instead — this matches how IDF's CLIC handler dispatches,
++                // off the cause (`mcause & VECTORS_MCAUSE_REASON_MASK`) rather than `mintstatus`
++                // (ESP-IDF components/riscv/vectors.S `_interrupt_handler`).
++                #[cfg(esp32p4_rev_lt_v3)]
++                let prio = cpu_intr.level() as u8;
++                #[cfg(not(esp32p4_rev_lt_v3))]
+                 let prio = cpu_int::current_runlevel();
+                 let mcause = riscv::register::mcause::read();
+             } else {
+diff --git a/esp-hal/src/interrupt/riscv/clic.rs b/esp-hal/src/interrupt/riscv/clic.rs
+index 4aa0bfe4..cc764ce0 100644
+--- a/esp-hal/src/interrupt/riscv/clic.rs
++++ b/esp-hal/src/interrupt/riscv/clic.rs
+@@ -68,7 +68,7 @@ pub(super) fn change_current_runlevel(level: RunLevel) -> u8 {
+ 
+     // All machine mode pending interrupts with levels less than or equal
+     // to the effective threshold level are not allowed to preempt the execution.
+-    unsafe { mintthresh::write(prio_to_bits(level) as usize) };
++    unsafe { intthresh::write(prio_to_bits(level) as usize) };
+ 
+     current_runlevel
+ }
+@@ -79,11 +79,11 @@ pub(crate) fn mil() -> usize {
+ }
+ 
+ pub(super) fn current_runlevel() -> u8 {
+-    let mintthresh = mintthresh::read();
++    let thresh = intthresh::read();
+ 
+     let mil = mil();
+ 
+-    let level = mil.max(mintthresh);
++    let level = mil.max(thresh);
+ 
+     bits_to_prio(level)
+ }
+@@ -105,11 +105,42 @@ fn bits_to_prio(bits: usize) -> u8 {
+     }
+ }
+ 
+-mod mintthresh {
++/// Interrupt-level threshold (the level below which interrupts are masked).
++///
++/// Standard CLIC (incl. ESP32-P4 v3.0+) uses the `mintthresh` CSR (0x347). Pre-v3
++/// ESP32-P4's non-standard CLIC has no such CSR (0x347 traps illegal-instruction);
++/// the threshold is the memory-mapped `CLIC_INT_THRESH_REG`, upper 8 bits. Selected by
++/// the `esp32p4-rev-lt-v3` esp-config option (mirrors IDF
++/// `CONFIG_ESP32P4_SELECTS_REV_LESS_V3`); the memory-mapped path mirrors IDF
++/// `rv_utils_{get,restore}_interrupt_threshold` under `!INTTHRESH_STANDARD`.
++#[cfg(not(esp32p4_rev_lt_v3))]
++mod intthresh {
+     riscv::read_csr_as_usize!(0x347);
+     riscv::write_csr_as_usize!(0x347);
+ }
+ 
++#[cfg(esp32p4_rev_lt_v3)]
++mod intthresh {
++    // CLIC_INT_THRESH_REG = DR_REG_CLIC_BASE (0x2080_0000) + 0x8, threshold in the top
++    // byte (CLIC_CPU_INT_THRESH_S = 24). The CLIC region is CPU-local, so this fixed
++    // address always targets the current core.
++    const CLIC_INT_THRESH_REG: *mut u32 = 0x2080_0008 as *mut u32;
++    const THRESH_SHIFT: u32 = 24;
++
++    #[inline]
++    pub fn read() -> usize {
++        let v = unsafe { CLIC_INT_THRESH_REG.read_volatile() };
++        ((v >> THRESH_SHIFT) & 0xff) as usize
++    }
++
++    #[inline]
++    pub unsafe fn write(val: usize) {
++        unsafe { CLIC_INT_THRESH_REG.write_volatile(((val as u32) & 0xff) << THRESH_SHIFT) };
++        // Read back so the write lands before the caller re-enables mstatus.mie (per IDF).
++        let _ = unsafe { CLIC_INT_THRESH_REG.read_volatile() };
++    }
++}
++
+ mod mintstatus {
+     // Work around riscv using a non-qualified `assert!` in constants
+     macro_rules! assert {
+@@ -117,11 +148,21 @@ mod mintstatus {
+                 ::core::assert!($($tt)*)
+             };
+         }
++    // Standard CLIC places `mintstatus` at 0xFB1; pre-v3 ESP32-P4's non-standard CLIC
++    // at 0x346. (On the non-standard CLIC the 0x346 `mil` reads inconsistently with the
++    // slot ctl encoding, so `handle_interrupts` does not rely on it — see riscv.rs.)
++    #[cfg(not(esp32p4_rev_lt_v3))]
+     riscv::read_only_csr! {
+         /// `mintstatus` register
+         Mintstatus: 0xfb1,
+         mask: usize::MAX,
+     }
++    #[cfg(esp32p4_rev_lt_v3)]
++    riscv::read_only_csr! {
++        /// `mintstatus` register (non-standard ESP32-P4 CLIC address)
++        Mintstatus: 0x346,
++        mask: usize::MAX,
++    }
+     riscv::read_only_csr_field! {
+         Mintstatus,
+         /// Returns the `mil` field.
+diff --git a/esp-hal/src/rtc_cntl/rtc/esp32p4.rs b/esp-hal/src/rtc_cntl/rtc/esp32p4.rs
+index f468d75c..ec613f9e 100644
+--- a/esp-hal/src/rtc_cntl/rtc/esp32p4.rs
++++ b/esp-hal/src/rtc_cntl/rtc/esp32p4.rs
+@@ -160,17 +160,21 @@ pub(crate) fn init() {
+         w.force_dcdc_switch_pd().bit(false)
+     });
+ 
+-    // 7. Enable CPLL (400 MHz) and SPLL (480 MHz)
+-    cpll_configure(400);
++    // 7. Enable CPLL and SPLL (480 MHz). Pre-v3.0 silicon is qualified for a 360 MHz maximum CPU
++    //    clock (CPLL 360 MHz); v3.0+ raises this to 400 MHz. ESP-IDF makes the same split via
++    //    `CONFIG_ESP32P4_SELECTS_REV_LESS_V3`:
++    //    https://github.com/espressif/esp-idf/blob/de7baafb265625d66fd0af4ed4761a9c5b200bde/components/esp_hw_support/port/esp32p4/rtc_clk.c#L320
++    cpll_configure(if cfg!(esp32p4_rev_lt_v3) { 360 } else { 400 });
+     spll_configure(480);
+ 
+-    // 8. Set CPU divider to 1 (400 MHz CPU), MEM divider 2, APB divider 2
++    // 8. Set CPU divider to 1 (max CPU clock: 360 MHz pre-v3.0, 400 MHz v3.0+), MEM divider 2, APB
++    //    divider 2
+     // Set CPU divider: cpu_clk_div_num = divider - 1 = 0
+     // Ref: HP_SYS_CLKRST.root_clk_ctrl0.reg_cpu_clk_div_num
+     HP_SYS_CLKRST::regs()
+         .root_clk_ctrl0()
+         .modify(|_, w| unsafe {
+-            w.cpu_clk_div_num().bits(0); // CPU: /1 = 400 MHz
++            w.cpu_clk_div_num().bits(0); // CPU: /1 (= CPLL: 360 MHz pre-v3.0, 400 MHz v3.0+)
+             w.cpu_clk_div_numerator().bits(0);
+             w.cpu_clk_div_denominator().bits(0)
+         });
+@@ -196,7 +200,6 @@ pub(crate) fn init() {
+ 
+ /// Configure CPLL for the given frequency (360 or 400 MHz).
+ ///
+-/// eco5 (v3.x) uses different I2C register values than eco4 (v1.x).
+ /// Ref: TRM v0.5 Ch 12 -- CPLL configuration
+ fn cpll_configure(freq_mhz: u32) {
+     // 1. Enable CPLL power PMU.imm_hp_ck_power: tie_high_xpd_pll, tie_high_xpd_pll_i2c Note: PAC
+@@ -212,12 +215,15 @@ fn cpll_configure(freq_mhz: u32) {
+     // Note: this field may not exist in eco4 PAC; use direct bit write if needed
+     // For now, the PLL is enabled via xpd_pll above.
+ 
+-    // 2. Configure CPLL via I2C analog registers
+-    // eco5 values (v3.x): div7_0 = 10 (400MHz), 9 (360MHz) with 40MHz XTAL
++    // 2. Configure CPLL via I2C analog registers (40 MHz XTAL).
++    // `div7_0` encoding is revision-dependent: pre-production v0.x samples use 6/5,
++    // all shipped silicon (v1.0+) uses 10/9 -- bits 2 and 3 are swapped between the two.
++    // Only v1.0+ is supported here. Ref: ESP-IDF `clk_ll_cpll_set_config`:
++    // https://github.com/espressif/esp-idf/blob/de7baafb265625d66fd0af4ed4761a9c5b200bde/components/esp_hal_clock/esp32p4/include/hal/clk_tree_ll.h#L375
+     let div7_0: u8 = match freq_mhz {
+-        400 => 10, // eco5: 400 MHz
+-        360 => 9,  // eco5: 360 MHz
+-        _ => 10,   // default to 400 MHz
++        400 => 10, // 400 MHz (v3.0+)
++        360 => 9,  // 360 MHz (pre-v3.0)
++        _ => 10,
+     };
+ 
+     // OC_REF_DIV + DCHGP: (oc_enb_fcal << 7) | (dchgp << 4) | div_ref = 0x50
+diff --git a/esp-hal/src/soc/esp32p4/clocks.rs b/esp-hal/src/soc/esp32p4/clocks.rs
+index f3b6469d..da8a571b 100644
+--- a/esp-hal/src/soc/esp32p4/clocks.rs
++++ b/esp-hal/src/soc/esp32p4/clocks.rs
+@@ -1,6 +1,6 @@
+-//! Clock tree for ESP32-P4X (chip revision v3.x / eco5).
++//! Clock tree for ESP32-P4.
+ //!
+-//! CPLL: 400 MHz (eco5 default), 360 MHz (conservative)
++//! CPLL: 400 MHz on v3.0+ silicon, 360 MHz on pre-v3.0 (`esp32p4_rev_lt_v3`)
+ //! SPLL: 480 MHz (peripheral clocks)
+ //! MPLL: 400 MHz (PSRAM, media)
+ //! XTAL: 40 MHz
+@@ -20,63 +20,89 @@
+ use esp_rom_sys::rom::ets_update_cpu_frequency_rom;
+ 
+ use crate::{
+-    peripherals::{HP_SYS_CLKRST, LP_AON_CLKRST},
++    peripherals::{HP_SYS_CLKRST, LP_AON_CLKRST, UART0, UART1, UART2, UART3, UART4},
+     time::Rate,
+ };
+ 
+ define_clock_tree_types!();
+ 
+ /// CPU clock frequency presets for ESP32-P4.
++///
++/// The CPU runs off the CPLL, which tops out at 360 MHz on pre-v3.0 silicon and 400 MHz on
++/// v3.0+ (see [`super`] clock tree). The three presets are CPLL/1, CPLL/2 and CPLL/4, so the
++/// available frequencies track the CPLL base accordingly.
+ #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+ #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+ #[non_exhaustive]
+ pub enum CpuClock {
+-    /// 400 MHz CPU clock (eco5 / v3.x maximum)
+-    /// CPLL -> CPU_ROOT -> CPU/1, APB divider /4 = 100MHz
++    /// 400 MHz CPU clock (CPLL/1; v3.0+ maximum).
++    #[cfg(not(esp32p4_rev_lt_v3))]
+     _400MHz = 400,
++    /// 360 MHz CPU clock (CPLL/1; pre-v3.0 maximum).
++    #[cfg(esp32p4_rev_lt_v3)]
++    _360MHz = 360,
+ 
+-    /// 200 MHz CPU clock (low power)
+-    /// CPLL -> CPU_ROOT -> CPU/2, APB /2 = 100MHz
++    /// 200 MHz CPU clock (CPLL/2).
++    #[cfg(not(esp32p4_rev_lt_v3))]
+     _200MHz = 200,
++    /// 180 MHz CPU clock (CPLL/2).
++    #[cfg(esp32p4_rev_lt_v3)]
++    _180MHz = 180,
+ 
+-    /// 100 MHz CPU clock (ultra low power)
+-    /// CPLL -> CPU_ROOT -> CPU/4, APB /1 = 100MHz
++    /// 100 MHz CPU clock (CPLL/4), default.
++    #[cfg(not(esp32p4_rev_lt_v3))]
+     #[default]
+     _100MHz = 100,
++    /// 90 MHz CPU clock (CPLL/4), default.
++    #[cfg(esp32p4_rev_lt_v3)]
++    #[default]
++    _90MHz  = 90,
+ }
+ 
+ impl CpuClock {
+-    // Preset: 400 MHz CPU, 100 MHz APB
+-    const PRESET_400: ClockConfig = ClockConfig {
++    // Highest preset (CPLL/1): 400 MHz on v3.0+, 360 MHz on pre-v3.0.
++    pub(crate) const MAX: Self = {
++        cfg_if::cfg_if! {
++            if #[cfg(esp32p4_rev_lt_v3)] { Self::_360MHz } else { Self::_400MHz }
++        }
++    };
++
++    // Dividers are identical for the 360 and 400 MHz CPLL: the constraint is MEM_CLK <= 200,
++    // APB_CLK <= 100 MHz, satisfied by the same divider tree in both cases (cf. ESP-IDF
++    // `rtc_clk_cpu_freq_to_cpll_mhz`):
++    // https://github.com/espressif/esp-idf/blob/de7baafb265625d66fd0af4ed4761a9c5b200bde/components/esp_hw_support/port/esp32p4/rtc_clk.c#L224
++
++    // CPLL/1 (max CPU), MEM CPLL/2, APB CPLL/4.
++    const PRESET_DIV1: ClockConfig = ClockConfig {
+         cpu_root_clk: Some(CpuRootClkConfig::Cpll),
+-        cpu_clk: Some(CpuClkConfig::new(0)), // /1 = 400 MHz
+-        mem_clk: Some(MemClkConfig::new(1)), // /2 = 200 MHz
+-        sys_clk: Some(SysClkConfig::new(0)), // /1 = 200 MHz
+-        apb_clk: Some(ApbClkConfig::new(1)), // /2 = 100 MHz
++        cpu_clk: Some(CpuClkConfig::new(0)), // /1
++        mem_clk: Some(MemClkConfig::new(1)), // /2
++        sys_clk: Some(SysClkConfig::new(0)), // /1
++        apb_clk: Some(ApbClkConfig::new(1)), // /2
+         lp_fast_clk: Some(LpFastClkConfig::RcFast),
+         lp_slow_clk: Some(LpSlowClkConfig::RcSlow),
+         timg_calibration_clock: None,
+     };
+ 
+-    // TODO: 360 MHz preset
+-
+-    const PRESET_200: ClockConfig = ClockConfig {
++    // CPLL/2 (CPU), APB CPLL/4.
++    const PRESET_DIV2: ClockConfig = ClockConfig {
+         cpu_root_clk: Some(CpuRootClkConfig::Cpll),
+-        cpu_clk: Some(CpuClkConfig::new(1)), // /2 = 200 MHz
+-        mem_clk: Some(MemClkConfig::new(0)), // /1 = 200 MHz
+-        sys_clk: Some(SysClkConfig::new(0)), // /1 = 200 MHz
+-        apb_clk: Some(ApbClkConfig::new(1)), // /2 = 100 MHz
++        cpu_clk: Some(CpuClkConfig::new(1)), // /2
++        mem_clk: Some(MemClkConfig::new(0)), // /1
++        sys_clk: Some(SysClkConfig::new(0)), // /1
++        apb_clk: Some(ApbClkConfig::new(1)), // /2
+         lp_fast_clk: Some(LpFastClkConfig::RcFast),
+         lp_slow_clk: Some(LpSlowClkConfig::RcSlow),
+         timg_calibration_clock: None,
+     };
+ 
+-    const PRESET_100: ClockConfig = ClockConfig {
++    // CPLL/4 (CPU), all downstream /1.
++    const PRESET_DIV4: ClockConfig = ClockConfig {
+         cpu_root_clk: Some(CpuRootClkConfig::Cpll),
+-        cpu_clk: Some(CpuClkConfig::new(3)), // /4 = 100 MHz
+-        mem_clk: Some(MemClkConfig::new(0)), // /1 = 100 MHz
+-        sys_clk: Some(SysClkConfig::new(0)), // /1 = 100 MHz
+-        apb_clk: Some(ApbClkConfig::new(0)), // /1 = 100 MHz
++        cpu_clk: Some(CpuClkConfig::new(3)), // /4
++        mem_clk: Some(MemClkConfig::new(0)), // /1
++        sys_clk: Some(SysClkConfig::new(0)), // /1
++        apb_clk: Some(ApbClkConfig::new(0)), // /1
+         lp_fast_clk: Some(LpFastClkConfig::RcFast),
+         lp_slow_clk: Some(LpSlowClkConfig::RcSlow),
+         timg_calibration_clock: None,
+@@ -86,9 +112,18 @@ impl CpuClock {
+ impl From<CpuClock> for ClockConfig {
+     fn from(value: CpuClock) -> ClockConfig {
+         match value {
+-            CpuClock::_400MHz => CpuClock::PRESET_400,
+-            CpuClock::_200MHz => CpuClock::PRESET_200,
+-            CpuClock::_100MHz => CpuClock::PRESET_100,
++            #[cfg(not(esp32p4_rev_lt_v3))]
++            CpuClock::_400MHz => CpuClock::PRESET_DIV1,
++            #[cfg(esp32p4_rev_lt_v3)]
++            CpuClock::_360MHz => CpuClock::PRESET_DIV1,
++            #[cfg(not(esp32p4_rev_lt_v3))]
++            CpuClock::_200MHz => CpuClock::PRESET_DIV2,
++            #[cfg(esp32p4_rev_lt_v3)]
++            CpuClock::_180MHz => CpuClock::PRESET_DIV2,
++            #[cfg(not(esp32p4_rev_lt_v3))]
++            CpuClock::_100MHz => CpuClock::PRESET_DIV4,
++            #[cfg(esp32p4_rev_lt_v3)]
++            CpuClock::_90MHz => CpuClock::PRESET_DIV4,
+         }
+     }
+ }
+@@ -102,9 +137,18 @@ impl Default for ClockConfig {
+ impl ClockConfig {
+     pub(crate) fn try_get_preset(self) -> Option<CpuClock> {
+         match self {
+-            v if v == CpuClock::PRESET_400 => Some(CpuClock::_400MHz),
+-            v if v == CpuClock::PRESET_200 => Some(CpuClock::_200MHz),
+-            v if v == CpuClock::PRESET_100 => Some(CpuClock::_100MHz),
++            #[cfg(not(esp32p4_rev_lt_v3))]
++            v if v == CpuClock::PRESET_DIV1 => Some(CpuClock::_400MHz),
++            #[cfg(esp32p4_rev_lt_v3)]
++            v if v == CpuClock::PRESET_DIV1 => Some(CpuClock::_360MHz),
++            #[cfg(not(esp32p4_rev_lt_v3))]
++            v if v == CpuClock::PRESET_DIV2 => Some(CpuClock::_200MHz),
++            #[cfg(esp32p4_rev_lt_v3)]
++            v if v == CpuClock::PRESET_DIV2 => Some(CpuClock::_180MHz),
++            #[cfg(not(esp32p4_rev_lt_v3))]
++            v if v == CpuClock::PRESET_DIV4 => Some(CpuClock::_100MHz),
++            #[cfg(esp32p4_rev_lt_v3)]
++            v if v == CpuClock::PRESET_DIV4 => Some(CpuClock::_90MHz),
+             _ => None,
+         }
+     }
+@@ -288,10 +332,60 @@ impl UartInstance {
+         self,
+         _clocks: &mut ClockTree,
+         _old_config: Option<UartFunctionClockConfig>,
+-        _new_config: UartFunctionClockConfig,
++        new_config: UartFunctionClockConfig,
+     ) {
+-        // TODO: Configure UART clock source selection
+-        // HP_SYS_CLKRST PERI_CLK_CTRL110-114 for UART0-4
++        // UART function-clock mux + predivider (HP_SYS_CLKRST). The register
++        // map is off-by-one: UARTn's source selector lives in
++        // PERI_CLK_CTRL(110+n), while UARTn's sclk divider lives in
++        // PERI_CLK_CTRL(111+n) (cf. ESP-IDF uart_ll_set_sclk /
++        // uart_ll_set_baudrate for esp32p4, hw_ver1 register headers).
++        //
++        // Hardware encoding of the 2-bit source selector:
++        // 0 = XTAL (40 MHz), 1 = RC_FAST, 2 = PLL_F80M — this does NOT match
++        // the declaration order of UartFunctionClockSclk, so map explicitly.
++        let src_sel = match new_config.sclk {
++            UartFunctionClockSclk::Xtal => 0,
++            UartFunctionClockSclk::RcFast => 1,
++            UartFunctionClockSclk::PllF80m => 2,
++        };
++        // Function clock = sclk / (div_num + 1). The numerator/denominator
++        // fraction fields are unused (stay at their reset value 0).
++        let div_num = new_config.div_num;
++        let regs = HP_SYS_CLKRST::regs();
++        match self {
++            UartInstance::Uart0 => {
++                regs.peri_clk_ctrl110()
++                    .modify(|_, w| unsafe { w.uart0_clk_src_sel().bits(src_sel) });
++                regs.peri_clk_ctrl111()
++                    .modify(|_, w| unsafe { w.uart0_sclk_div_num().bits(div_num as _) });
++            }
++            UartInstance::Uart1 => {
++                regs.peri_clk_ctrl111()
++                    .modify(|_, w| unsafe { w.uart1_clk_src_sel().bits(src_sel) });
++                regs.peri_clk_ctrl112()
++                    .modify(|_, w| unsafe { w.uart1_sclk_div_num().bits(div_num as _) });
++            }
++            UartInstance::Uart2 => {
++                regs.peri_clk_ctrl112()
++                    .modify(|_, w| unsafe { w.uart2_clk_src_sel().bits(src_sel) });
++                regs.peri_clk_ctrl113()
++                    .modify(|_, w| unsafe { w.uart2_sclk_div_num().bits(div_num as _) });
++            }
++            UartInstance::Uart3 => {
++                regs.peri_clk_ctrl113()
++                    .modify(|_, w| unsafe { w.uart3_clk_src_sel().bits(src_sel) });
++                regs.peri_clk_ctrl114()
++                    .modify(|_, w| unsafe { w.uart3_sclk_div_num().bits(div_num as _) });
++            }
++            UartInstance::Uart4 => {
++                regs.peri_clk_ctrl114()
++                    .modify(|_, w| unsafe { w.uart4_clk_src_sel().bits(src_sel) });
++                regs.peri_clk_ctrl115()
++                    .modify(|_, w| unsafe { w.uart4_sclk_div_num().bits(div_num as _) });
++            }
++        }
++        // HP_SYS_CLKRST has no clock-domain sync bit; atomicity is provided
++        // by the caller holding the ClockTree mutex.
+     }
+ 
+     fn enable_baud_rate_generator_impl(self, _clocks: &mut ClockTree, _en: bool) {
+@@ -302,9 +396,23 @@ impl UartInstance {
+         self,
+         _clocks: &mut ClockTree,
+         _old_config: Option<UartBaudRateGeneratorConfig>,
+-        _new_config: UartBaudRateGeneratorConfig,
++        new_config: UartBaudRateGeneratorConfig,
+     ) {
+-        // Baud rate is configured directly in UART registers, not here
++        // UARTn baud-rate generator divider: CLKDIV integral part in bits
++        // 11:0, fractional part (x/16) in CLKDIV_FRAG bits 23:20. The
++        // change_baud path calls sync_regs() right after this, which sets
++        // REG_UPDATE bit 0 to push the values into the UART clock domain.
++        let regs = match self {
++            UartInstance::Uart0 => UART0::regs(),
++            UartInstance::Uart1 => UART1::regs(),
++            UartInstance::Uart2 => UART2::regs(),
++            UartInstance::Uart3 => UART3::regs(),
++            UartInstance::Uart4 => UART4::regs(),
++        };
++        regs.clkdiv().write(|w| unsafe {
++            w.clkdiv().bits(new_config.integral as _);
++            w.clkdiv_frag().bits(new_config.fractional as _)
++        });
+     }
+ }
+ 
+diff --git a/esp-metadata-generated/src/_generated_esp32p4.rs b/esp-metadata-generated/src/_generated_esp32p4.rs
+index 3d4f4d4a..7bee182c 100644
+--- a/esp-metadata-generated/src/_generated_esp32p4.rs
++++ b/esp-metadata-generated/src/_generated_esp32p4.rs
+@@ -2065,7 +2065,16 @@ macro_rules! define_clock_tree_types {
+             }
+         }
+         pub fn cpll_clk_frequency() -> u32 {
+-            400000000
++            {
++                #[cfg(esp32p4_rev_lt_v3)]
++                {
++                    360000000
++                }
++                #[cfg(not(any(esp32p4_rev_lt_v3)))]
++                {
++                    400000000
++                }
++            }
+         }
+         pub fn cpll_clk_source_frequency() -> u32 {
+             xtal_clk_frequency()
+diff --git a/esp-metadata/devices/esp32p4.toml b/esp-metadata/devices/esp32p4.toml
+index e2dd7703..155d4957 100644
+--- a/esp-metadata/devices/esp32p4.toml
++++ b/esp-metadata/devices/esp32p4.toml
+@@ -56,12 +56,13 @@ cpu_has_csr_pc = false
+ rc_fast_clk_default = 20_000_000
+ internal_memory_cached = true
+ 
+-# Clock tree for ESP32-P4 (eco5 / chip revision v3.x)
++# Clock tree for ESP32-P4. CPLL tops out at 360 MHz on pre-v3.0 silicon and 400 MHz on v3.0+.
+ # 3 PLLs: CPLL (CPU, 360/400MHz), SPLL (480MHz, peripherals), MPLL (400MHz, PSRAM/media)
+ clocks = { system_clocks = { clock_tree = [
+     # High-speed clock sources
+     { name = "XTAL_CLK",    type = "source",  output = "40_000_000", always_on = true },
+-    { name = "CPLL_CLK",    type = "derived", from = "XTAL_CLK", output = "400_000_000" }, # eco5 default 400MHz
++    # CPLL: 400 MHz on v3.0+ silicon, 360 MHz on pre-v3.0 (`esp32p4_rev_lt_v3`); see rtc_cntl
++    { name = "CPLL_CLK",    type = "derived", from = "XTAL_CLK", output = "400_000_000", output-overrides = { esp32p4_rev_lt_v3 = "360_000_000" } },
+     { name = "SPLL_CLK",    type = "derived", from = "XTAL_CLK", output = "480_000_000" }, # System PLL
+     { name = "MPLL_CLK",    type = "derived", from = "XTAL_CLK", output = "500_000_000" }, # Media PLL
+     { name = "RC_FAST_CLK", type = "source",                     output = "20_000_000" },
+diff --git a/esp-metadata/src/cfg/soc/clock_tree/source.rs b/esp-metadata/src/cfg/soc/clock_tree/source.rs
+index 1246c11c..b7a4d6a4 100644
+--- a/esp-metadata/src/cfg/soc/clock_tree/source.rs
++++ b/esp-metadata/src/cfg/soc/clock_tree/source.rs
+@@ -72,6 +72,13 @@ pub struct Source {
+     values: Option<ValuesExpression>,
+ 
+     output: OutputExpression,
++
++    /// Per-`cfg` overrides for `output`. Each key is a `cfg` predicate; when it is active the
++    /// corresponding expression replaces `output`. Used for sources whose fixed frequency
++    /// depends on a build-time selection, e.g. the ESP32-P4 CPLL runs at 360 MHz on pre-v3.0
++    /// silicon (`esp32p4_rev_lt_v3`) and 400 MHz otherwise. The overrides must be constant.
++    #[serde(default, rename = "output-overrides")]
++    output_overrides: std::collections::BTreeMap<String, OutputExpression>,
+ }
+ 
+ impl ClockTreeNodeType for Source {
+@@ -130,8 +137,36 @@ impl ClockTreeNodeType for Source {
+     ) -> TokenStream {
+         if self.values.is_some() {
+             quote! { config.value() }
+-        } else {
++        } else if self.output_overrides.is_empty() {
+             self.output.0.to_rust(HashMap::new(), instance, tree)
++        } else {
++            // Emit one `#[cfg]`-gated arm per override plus a default arm for the remaining
++            // case. Exactly one survives cfg evaluation and becomes the block's tail
++            // expression. `cfg` predicates are taken verbatim from the override keys.
++            let predicates: Vec<TokenStream> = self
++                .output_overrides
++                .keys()
++                .map(|cfg| {
++                    cfg.parse()
++                        .expect("invalid cfg predicate in output-overrides")
++                })
++                .collect();
++            let arms = self
++                .output_overrides
++                .values()
++                .zip(&predicates)
++                .map(|(expr, pred)| {
++                    let value = expr.0.to_rust(HashMap::new(), instance, tree);
++                    quote! { #[cfg(#pred)] { #value } }
++                });
++            let default = self.output.0.to_rust(HashMap::new(), instance, tree);
++            quote! {
++                {
++                    #(#arms)*
++                    #[cfg(not(any(#(#predicates),*)))]
++                    { #default }
++                }
++            }
+         }
+     }
+ 
+diff --git a/esp-metadata/src/lib.rs b/esp-metadata/src/lib.rs
+index 6bbf58a7..9ba4d194 100644
+--- a/esp-metadata/src/lib.rs
++++ b/esp-metadata/src/lib.rs
+@@ -123,7 +123,7 @@ pub enum Chip {
+     Esp32c61,
+     /// ESP32-H2
+     Esp32h2,
+-    /// ESP32-P4 (chip revision v3.x / eco5 only)
++    /// ESP32-P4 (defaults to chip revision v3.0+; pre-v3.0 via `min-chip-revision`)
+     Esp32p4,
+     /// ESP32-S2
+     Esp32s2,
+diff --git a/esp-rom-sys/CHANGELOG.md b/esp-rom-sys/CHANGELOG.md
+index 87ec9268..3b883ccd 100644
+--- a/esp-rom-sys/CHANGELOG.md
++++ b/esp-rom-sys/CHANGELOG.md
+@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
++**Downstream fork change:** Accept non-decimal `ESP_HAL_CONFIG_MIN_CHIP_REVISION` values when selecting ESP32-P4 ROM linker scripts.
++
+ ## [Unreleased]
+ 
+ ### Added
+diff --git a/esp-rom-sys/Cargo.toml b/esp-rom-sys/Cargo.toml
+index 8f6d72bc..6320b489 100644
+--- a/esp-rom-sys/Cargo.toml
++++ b/esp-rom-sys/Cargo.toml
+@@ -42,6 +42,7 @@ esp32s3 = { version = "0.35", features = ["critical-section"], optional = true }
+ esp32p4 = { version = "0.2", features = ["critical-section"], optional = true, git = "https://github.com/esp-rs/esp-pacs", rev = "fc3e6d4" }
+ 
+ [build-dependencies]
++esp-config             = { version = "0.7.0", path = "../esp-config", features = ["build"] }
+ esp-metadata-generated = { version = "0.4.0", path = "../esp-metadata-generated", features = ["build-script"] }
+ 
+ [features]
+diff --git a/esp-rom-sys/build.rs b/esp-rom-sys/build.rs
+index c23283d2..d1719285 100644
+--- a/esp-rom-sys/build.rs
++++ b/esp-rom-sys/build.rs
+@@ -1,5 +1,7 @@
+ use std::{error::Error, path::Path};
+ 
++use esp_config::Value;
++
+ fn main() -> Result<(), Box<dyn Error>> {
+     let self_version = std::env::var("CARGO_PKG_VERSION")?;
+     let self_version: Vec<&str> = self_version.split('.').collect();
+@@ -15,7 +17,33 @@ fn main() -> Result<(), Box<dyn Error>> {
+     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+     println!("cargo:rustc-link-search={}", out.display());
+ 
+-    copy_dir_all(format!("./ld/{}/", chip.name()), &out)?;
++    // P4 ROM entry points differ between pre-v3 and v3+ silicon. Use the
++    // same revision setting as esp-hal rather than linking a second profile.
++    println!("cargo:rerun-if-env-changed=ESP_HAL_CONFIG_MIN_CHIP_REVISION");
++    let mut minimum_revision = Value::Integer(300);
++    match std::env::var("ESP_HAL_CONFIG_MIN_CHIP_REVISION") {
++        Ok(value) => minimum_revision.parse_in_place(&value).map_err(|error| {
++            std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                format!("Invalid ESP_HAL_CONFIG_MIN_CHIP_REVISION: {error}"),
++            )
++        })?,
++        Err(std::env::VarError::NotPresent) => {}
++        Err(error) => return Err(error.into()),
++    };
++    // Keep the ROM build's accepted range aligned with esp-hal's `u16` config.
++    let minimum_revision = u16::try_from(minimum_revision.as_integer()).map_err(|_| {
++        std::io::Error::new(
++            std::io::ErrorKind::InvalidInput,
++            "ESP_HAL_CONFIG_MIN_CHIP_REVISION must fit in u16",
++        )
++    })?;
++    let linker_chip = if chip.name() == "esp32p4" && minimum_revision < 300 {
++        "esp32p4-eco0_4"
++    } else {
++        chip.name()
++    };
++    copy_dir_all(format!("./ld/{linker_chip}/"), &out)?;
+     copy_dir_all(format!("./libs/{}/", chip.name()), &out)?;
+ 
+     include_libs(format!("./libs/{}/", chip.name()))?;
+diff --git a/esp-rom-sys/ld/esp32p4-eco0_4/libesp_rom_sys.a b/esp-rom-sys/ld/esp32p4-eco0_4/libesp_rom_sys.a
+new file mode 100644
+index 00000000..aff08cf6
+--- /dev/null
++++ b/esp-rom-sys/ld/esp32p4-eco0_4/libesp_rom_sys.a
+@@ -0,0 +1 @@
++INCLUDE "rom-functions.x"
+diff --git a/esp-rom-sys/ld/esp32p4-eco0_4/rom-functions.x b/esp-rom-sys/ld/esp32p4-eco0_4/rom-functions.x
+new file mode 100644
+index 00000000..02a91bc7
+--- /dev/null
++++ b/esp-rom-sys/ld/esp32p4-eco0_4/rom-functions.x
+@@ -0,0 +1,7 @@
++INCLUDE "rom/esp32p4.rom.api.ld"
++INCLUDE "rom/esp32p4.rom.ld"
++INCLUDE "rom/esp32p4.rom.libgcc.ld"
++INCLUDE "rom/esp32p4.rom.rvfp.ld"
++INCLUDE "rom/esp32p4.rom.version.ld"
++
++INCLUDE "rom/additional.ld"
+diff --git a/esp-rom-sys/ld/esp32p4-eco0_4/rom/additional.ld b/esp-rom-sys/ld/esp32p4-eco0_4/rom/additional.ld
+new file mode 100644
+index 00000000..8bfabb2f
+--- /dev/null
++++ b/esp-rom-sys/ld/esp32p4-eco0_4/rom/additional.ld
+@@ -0,0 +1,14 @@
++/* Ref: esp-idf v6.1 esp32p4/ld/esp32p4.rom.eco0_4.libc.ld */
++syscall_table_ptr = 0x4ff3ffe4;
++ets_update_cpu_frequency = 0x4fc00044;
++ets_printf = 0x4fc00024;
++PROVIDE(ets_delay_us = 0x4fc0003c);
++
++memset = 0x4fc00268;
++memcpy = 0x4fc0026c;
++memmove = 0x4fc00270;
++memcmp = 0x4fc00274;
++strcpy = 0x4fc00278;
++strncpy = 0x4fc0027c;
++strcmp = 0x4fc00280;
++strncmp = 0x4fc00284;
+diff --git a/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.api.ld b/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.api.ld
+new file mode 100644
+index 00000000..0926faf4
+--- /dev/null
++++ b/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.api.ld
+@@ -0,0 +1,67 @@
++/*
++ * SPDX-FileCopyrightText: 2023-2024 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++/** ROM APIs
++ */
++
++PROVIDE ( esp_rom_crc32_le = crc32_le );
++PROVIDE ( esp_rom_crc16_le = crc16_le );
++PROVIDE ( esp_rom_crc8_le  = crc8_le );
++PROVIDE ( esp_rom_crc32_be = crc32_be );
++PROVIDE ( esp_rom_crc16_be = crc16_be );
++PROVIDE ( esp_rom_crc8_be  = crc8_be );
++
++PROVIDE ( esp_rom_gpio_pad_select_gpio    = rom_gpio_pad_select_gpio );
++PROVIDE ( esp_rom_gpio_pad_pullup_only    = rom_gpio_pad_pullup );
++PROVIDE ( esp_rom_gpio_pad_set_drv        = rom_gpio_pad_set_drv );
++PROVIDE ( esp_rom_gpio_pad_unhold         = rom_gpio_pad_unhold );
++PROVIDE ( esp_rom_gpio_connect_in_signal  = rom_gpio_matrix_in );
++PROVIDE ( esp_rom_gpio_connect_out_signal = rom_gpio_matrix_out );
++
++PROVIDE ( esp_rom_efuse_mac_address_crc8       = esp_crc8 );
++PROVIDE ( esp_rom_efuse_is_secure_boot_enabled = ets_efuse_secure_boot_enabled );
++
++PROVIDE ( esp_rom_uart_flush_tx       = uart_tx_flush );
++PROVIDE ( esp_rom_uart_tx_one_char    = uart_tx_one_char2 );
++PROVIDE ( esp_rom_uart_tx_wait_idle   = uart_tx_wait_idle );
++PROVIDE ( esp_rom_uart_rx_one_char    = uart_rx_one_char );
++PROVIDE ( esp_rom_uart_rx_string      = UartRxString );
++PROVIDE ( esp_rom_uart_set_as_console = uart_tx_switch );
++PROVIDE ( esp_rom_uart_putc           = ets_write_char_uart );
++
++PROVIDE ( esp_rom_usb_serial_putc     = uart_tx_one_char3 );
++
++PROVIDE ( esp_rom_output_flush_tx       = uart_tx_flush );
++PROVIDE ( esp_rom_output_tx_one_char    = uart_tx_one_char );
++PROVIDE ( esp_rom_output_tx_wait_idle   = uart_tx_wait_idle );
++PROVIDE ( esp_rom_output_rx_one_char    = uart_rx_one_char );
++PROVIDE ( esp_rom_output_rx_string      = UartRxString );
++PROVIDE ( esp_rom_output_set_as_console = uart_tx_switch );
++PROVIDE ( esp_rom_output_putc           = ets_write_char_uart );
++
++PROVIDE ( esp_rom_md5_init   = MD5Init );
++PROVIDE ( esp_rom_md5_update = MD5Update );
++PROVIDE ( esp_rom_md5_final  = MD5Final );
++
++PROVIDE ( esp_rom_software_reset_system = software_reset );
++PROVIDE ( esp_rom_software_reset_cpu    = software_reset_cpu );
++
++PROVIDE ( esp_rom_printf   = ets_printf );
++PROVIDE ( esp_rom_install_uart_printf = ets_install_uart_printf );
++PROVIDE ( esp_rom_delay_us = ets_delay_us );
++PROVIDE ( esp_rom_get_reset_reason = rtc_get_reset_reason );
++PROVIDE ( esp_rom_route_intr_matrix = intr_matrix_set );
++PROVIDE ( esp_rom_get_cpu_ticks_per_us = ets_get_cpu_frequency );
++PROVIDE ( esp_rom_set_cpu_ticks_per_us = ets_update_cpu_frequency );
++
++PROVIDE ( esp_rom_spiflash_attach = spi_flash_attach );
++PROVIDE ( esp_rom_spiflash_clear_bp = esp_rom_spiflash_unlock );
++PROVIDE ( esp_rom_spiflash_write_enable = SPI_write_enable );
++PROVIDE ( esp_rom_spiflash_erase_area = SPIEraseArea );
++
++PROVIDE ( esp_rom_spiflash_fix_dummylen = spi_dummy_len_fix );
++PROVIDE ( esp_rom_spiflash_set_drvs = SetSpiDrvs);
++PROVIDE ( esp_rom_spiflash_select_padsfunc = SelectSpiFunction );
++PROVIDE ( esp_rom_spiflash_common_cmd = SPI_Common_Command );
+diff --git a/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.ld b/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.ld
+new file mode 100644
+index 00000000..f0bfa948
+--- /dev/null
++++ b/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.ld
+@@ -0,0 +1,584 @@
++/*
++ * SPDX-FileCopyrightText: 2023-2026 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++/* ROM function interface esp32p4.rom.ld for esp32p4
++ *
++ *
++ * Generated from ./target/esp32p4/interface-esp32p4.yml md5sum f6516bd9708d890f63db87f8aed53ca7
++ *
++ * Compatible with ROM where ECO version equal or greater to 0.
++ *
++ * THIS FILE WAS AUTOMATICALLY GENERATED. DO NOT EDIT.
++ */
++
++/***************************************
++ Group common
++ ***************************************/
++
++/* Functions */
++rtc_get_reset_reason = 0x4fc00018;
++rtc_get_wakeup_cause = 0x4fc0001c;
++pmu_enable_unhold_pads = 0x4fc00020;
++ets_printf = 0x4fc00024;
++ets_install_putc1 = 0x4fc00028;
++ets_install_putc2 = 0x4fc0002c;
++ets_install_uart_printf = 0x4fc00030;
++ets_install_usb_printf = 0x4fc00034;
++ets_get_printf_channel = 0x4fc00038;
++ets_delay_us = 0x4fc0003c;
++ets_get_cpu_frequency = 0x4fc00040;
++ets_update_cpu_frequency = 0x4fc00044;
++ets_install_lock = 0x4fc00048;
++UartRxString = 0x4fc0004c;
++UartGetCmdLn = 0x4fc00050;
++uart_tx_one_char = 0x4fc00054;
++uart_tx_one_char2 = 0x4fc00058;
++uart_tx_one_char3 = 0x4fc0005c;
++uart_rx_one_char = 0x4fc00060;
++uart_rx_one_char_block = 0x4fc00064;
++uart_rx_intr_handler = 0x4fc00068;
++uart_rx_readbuff = 0x4fc0006c;
++uartAttach = 0x4fc00070;
++uart_tx_flush = 0x4fc00074;
++uart_tx_wait_idle = 0x4fc00078;
++uart_div_modify = 0x4fc0007c;
++ets_write_char_uart = 0x4fc00080;
++uart_tx_switch = 0x4fc00084;
++uart_buff_switch = 0x4fc00088;
++roundup2 = 0x4fc0008c;
++multofup = 0x4fc00090;
++software_reset = 0x4fc00094;
++software_reset_cpu = 0x4fc00098;
++ets_clk_assist_debug_clock_enable = 0x4fc0009c;
++clear_super_wdt_reset_flag = 0x4fc000a0;
++disable_default_watchdog = 0x4fc000a4;
++ets_set_appcpu_boot_addr = 0x4fc000a8;
++send_packet = 0x4fc000ac;
++recv_packet = 0x4fc000b0;
++GetUartDevice = 0x4fc000b4;
++UartDwnLdProc = 0x4fc000b8;
++GetSecurityInfoProc = 0x4fc000bc;
++Uart_Init = 0x4fc000c0;
++ets_set_user_start = 0x4fc000c4;
++/* Data (.data, .bss, .rodata) */
++ets_rom_layout_p = 0x4fc1fffc;
++ets_ops_table_ptr = 0x4ff3fff4;
++g_saved_pc = 0x4ff3fff8;
++
++
++/***************************************
++ Group miniz
++ ***************************************/
++
++/* Functions */
++mz_adler32 = 0x4fc000c8;
++mz_free = 0x4fc000cc;
++tdefl_compress = 0x4fc000d0;
++tdefl_compress_buffer = 0x4fc000d4;
++tdefl_compress_mem_to_heap = 0x4fc000d8;
++tdefl_compress_mem_to_mem = 0x4fc000dc;
++tdefl_compress_mem_to_output = 0x4fc000e0;
++tdefl_get_adler32 = 0x4fc000e4;
++tdefl_get_prev_return_status = 0x4fc000e8;
++tdefl_init = 0x4fc000ec;
++tdefl_write_image_to_png_file_in_memory = 0x4fc000f0;
++tdefl_write_image_to_png_file_in_memory_ex = 0x4fc000f4;
++tinfl_decompress = 0x4fc000f8;
++tinfl_decompress_mem_to_callback = 0x4fc000fc;
++tinfl_decompress_mem_to_heap = 0x4fc00100;
++tinfl_decompress_mem_to_mem = 0x4fc00104;
++
++
++/***************************************
++ Group spi_extmem_common
++ ***************************************/
++
++/* Functions */
++esp_rom_spi_cmd_config = 0x4fc00108;
++esp_rom_spi_cmd_start = 0x4fc0010c;
++esp_rom_spi_set_op_mode = 0x4fc00110;
++esp_rom_spi_set_dtr_swap_mode = 0x4fc00114;
++
++
++/***************************************
++ Group spiflash_legacy
++ ***************************************/
++
++/* Functions */
++esp_rom_spiflash_wait_idle = 0x4fc00118;
++esp_rom_spiflash_write_encrypted = 0x4fc0011c;
++esp_rom_spiflash_write_encrypted_dest = 0x4fc00120;
++esp_rom_spiflash_write_encrypted_enable = 0x4fc00124;
++esp_rom_spiflash_write_encrypted_disable = 0x4fc00128;
++esp_rom_spiflash_erase_chip = 0x4fc0012c;
++_esp_rom_spiflash_erase_sector = 0x4fc00130;
++_esp_rom_spiflash_erase_block = 0x4fc00134;
++_esp_rom_spiflash_write = 0x4fc00138;
++_esp_rom_spiflash_read = 0x4fc0013c;
++_esp_rom_spiflash_unlock = 0x4fc00140;
++_SPIEraseArea = 0x4fc00144;
++_SPI_write_enable = 0x4fc00148;
++esp_rom_spiflash_erase_sector = 0x4fc0014c;
++esp_rom_spiflash_erase_block = 0x4fc00150;
++esp_rom_spiflash_write = 0x4fc00154;
++esp_rom_spiflash_read = 0x4fc00158;
++esp_rom_spiflash_unlock = 0x4fc0015c;
++SPIEraseArea = 0x4fc00160;
++SPI_write_enable = 0x4fc00164;
++esp_rom_spiflash_config_param = 0x4fc00168;
++esp_rom_spiflash_read_user_cmd = 0x4fc0016c;
++esp_rom_spiflash_select_qio_pins = 0x4fc00170;
++esp_rom_spi_flash_auto_sus_res = 0x4fc00174;
++esp_rom_spi_flash_send_resume = 0x4fc00178;
++esp_rom_spi_flash_update_id = 0x4fc0017c;
++esp_rom_spiflash_config_clk = 0x4fc00180;
++esp_rom_spiflash_config_readmode = 0x4fc00184;
++esp_rom_spiflash_read_status = 0x4fc00188;
++esp_rom_spiflash_read_statushigh = 0x4fc0018c;
++esp_rom_spiflash_write_status = 0x4fc00190;
++esp_rom_spiflash_write_disable = 0x4fc00194;
++spi_cache_mode_switch = 0x4fc00198;
++spi_common_set_dummy_output = 0x4fc0019c;
++spi_common_set_flash_cs_timing = 0x4fc001a0;
++esp_rom_spi_set_address_bit_len = 0x4fc001a4;
++SPILock = 0x4fc001a8;
++SPIMasterReadModeCnfig = 0x4fc001ac;
++SPI_Common_Command = 0x4fc001b0;
++SPI_WakeUp = 0x4fc001b4;
++SPI_block_erase = 0x4fc001b8;
++SPI_chip_erase = 0x4fc001bc;
++SPI_init = 0x4fc001c0;
++SPI_page_program = 0x4fc001c4;
++SPI_read_data = 0x4fc001c8;
++SPI_sector_erase = 0x4fc001cc;
++SelectSpiFunction = 0x4fc001d0;
++SetSpiDrvs = 0x4fc001d4;
++Wait_SPI_Idle = 0x4fc001d8;
++spi_dummy_len_fix = 0x4fc001dc;
++Disable_QMode = 0x4fc001e0;
++Enable_QMode = 0x4fc001e4;
++spi_flash_attach = 0x4fc001e8;
++spi_flash_get_chip_size = 0x4fc001ec;
++spi_flash_guard_set = 0x4fc001f0;
++spi_flash_guard_get = 0x4fc001f4;
++spi_flash_read_encrypted = 0x4fc001f8;
++/* Data (.data, .bss, .rodata) */
++rom_spiflash_legacy_funcs = 0x4ff3ffec;
++rom_spiflash_legacy_data = 0x4ff3ffe8;
++g_flash_guard_ops = 0x4ff3fff0;
++
++
++/***************************************
++ Group cache
++ ***************************************/
++
++/* Functions */
++Cache_Get_L1_ICache_Line_Size = 0x4fc003c4;
++Cache_Get_L1_DCache_Line_Size = 0x4fc003c8;
++Cache_Get_L2_Cache_Line_Size = 0x4fc003cc;
++Cache_Get_Mode = 0x4fc003d0;
++Cache_Set_L2_Cache_Mode = 0x4fc003d4;
++Cache_Address_Through_Cache = 0x4fc003d8;
++ROM_Boot_Cache_Init = 0x4fc003dc;
++Cache_Sync_Addr = 0x4fc003e0;
++Cache_Invalidate_Addr = 0x4fc003e4;
++Cache_Invalidate_Addr_Gid = 0x4fc003e8;
++Cache_Clean_Addr = 0x4fc003ec;
++Cache_Clean_Addr_Gid = 0x4fc003f0;
++PROVIDE (Cache_WriteBack_Addr = 0x4fc003f4 );
++Cache_WriteBack_Addr_Gid = 0x4fc003f8;
++PROVIDE( Cache_WriteBack_Invalidate_Addr = 0x4fc003fc );
++Cache_WriteBack_Invalidate_Addr_Gid = 0x4fc00400;
++Cache_Invalidate_All = 0x4fc00404;
++Cache_Invalidate_All_Gid = 0x4fc00408;
++Cache_Clean_All = 0x4fc0040c;
++Cache_Clean_All_Gid = 0x4fc00410;
++PROVIDE( Cache_WriteBack_All = 0x4fc00414 );
++Cache_WriteBack_All_Gid = 0x4fc00418;
++PROVIDE( Cache_WriteBack_Invalidate_All = 0x4fc0041c );
++Cache_WriteBack_Invalidate_All_Gid = 0x4fc00420;
++Cache_Mask_All = 0x4fc00424;
++Cache_Suspend_L1_CORE0_ICache_Autoload = 0x4fc00428;
++Cache_Resume_L1_CORE0_ICache_Autoload = 0x4fc0042c;
++Cache_Suspend_L1_CORE1_ICache_Autoload = 0x4fc00430;
++Cache_Resume_L1_CORE1_ICache_Autoload = 0x4fc00434;
++Cache_Suspend_L1_DCache_Autoload = 0x4fc00438;
++Cache_Resume_L1_DCache_Autoload = 0x4fc0043c;
++Cache_Suspend_L2_Cache_Autoload = 0x4fc00440;
++Cache_Resume_L2_Cache_Autoload = 0x4fc00444;
++Cache_Start_L1_CORE0_ICache_Preload = 0x4fc00448;
++Cache_L1_CORE0_ICache_Preload_Done = 0x4fc0044c;
++Cache_End_L1_CORE0_ICache_Preload = 0x4fc00450;
++Cache_Start_L1_CORE1_ICache_Preload = 0x4fc00454;
++Cache_L1_CORE1_ICache_Preload_Done = 0x4fc00458;
++Cache_End_L1_CORE1_ICache_Preload = 0x4fc0045c;
++Cache_Start_L1_DCache_Preload = 0x4fc00460;
++Cache_L1_DCache_Preload_Done = 0x4fc00464;
++Cache_End_L1_DCache_Preload = 0x4fc00468;
++Cache_Start_L2_Cache_Preload = 0x4fc0046c;
++Cache_L2_Cache_Preload_Done = 0x4fc00470;
++Cache_End_L2_Cache_Preload = 0x4fc00474;
++Cache_Config_L1_CORE0_ICache_Autoload = 0x4fc00478;
++Cache_Enable_L1_CORE0_ICache_Autoload = 0x4fc0047c;
++Cache_Disable_L1_CORE0_ICache_Autoload = 0x4fc00480;
++Cache_Config_L1_CORE1_ICache_Autoload = 0x4fc00484;
++Cache_Enable_L1_CORE1_ICache_Autoload = 0x4fc00488;
++Cache_Disable_L1_CORE1_ICache_Autoload = 0x4fc0048c;
++Cache_Config_L1_DCache_Autoload = 0x4fc00490;
++Cache_Enable_L1_DCache_Autoload = 0x4fc00494;
++Cache_Disable_L1_DCache_Autoload = 0x4fc00498;
++Cache_Config_L2_Cache_Autoload = 0x4fc0049c;
++Cache_Enable_L2_Cache_Autoload = 0x4fc004a0;
++Cache_Disable_L2_Cache_Autoload = 0x4fc004a4;
++Cache_Enable_L1_CORE0_ICache_PreLock = 0x4fc004a8;
++Cache_Disable_L1_CORE0_ICache_PreLock = 0x4fc004ac;
++Cache_Enable_L1_CORE1_ICache_PreLock = 0x4fc004b0;
++Cache_Disable_L1_CORE1_ICache_PreLock = 0x4fc004b4;
++Cache_Enable_L1_DCache_PreLock = 0x4fc004b8;
++Cache_Disable_L1_DCache_PreLock = 0x4fc004bc;
++Cache_Enable_L2_Cache_PreLock = 0x4fc004c0;
++Cache_Disable_L2_Cache_PreLock = 0x4fc004c4;
++Cache_Lock_Addr = 0x4fc004c8;
++Cache_Unlock_Addr = 0x4fc004cc;
++Cache_Disable_L1_CORE0_ICache = 0x4fc004d0;
++Cache_Enable_L1_CORE0_ICache = 0x4fc004d4;
++Cache_Suspend_L1_CORE0_ICache = 0x4fc004d8;
++Cache_Resume_L1_CORE0_ICache = 0x4fc004dc;
++Cache_Disable_L1_CORE1_ICache = 0x4fc004e0;
++Cache_Enable_L1_CORE1_ICache = 0x4fc004e4;
++Cache_Suspend_L1_CORE1_ICache = 0x4fc004e8;
++Cache_Resume_L1_CORE1_ICache = 0x4fc004ec;
++Cache_Disable_L1_DCache = 0x4fc004f0;
++Cache_Enable_L1_DCache = 0x4fc004f4;
++Cache_Suspend_L1_DCache = 0x4fc004f8;
++Cache_Resume_L1_DCache = 0x4fc004fc;
++Cache_Disable_L2_Cache = 0x4fc00500;
++Cache_Enable_L2_Cache = 0x4fc00504;
++Cache_Suspend_L2_Cache = 0x4fc00508;
++Cache_Resume_L2_Cache = 0x4fc0050c;
++Cache_FLASH_MMU_Init = 0x4fc00510;
++Cache_PSRAM_MMU_Init = 0x4fc00514;
++Cache_FLASH_MMU_Set = 0x4fc00518;
++Cache_FLASH_MMU_Set_Secure = 0x4fc0051c;
++Cache_PSRAM_MMU_Set = 0x4fc00520;
++Cache_PSRAM_MMU_Set_Secure = 0x4fc00524;
++Cache_Count_Flash_Pages = 0x4fc00528;
++Cache_Flash_To_SPIRAM_Copy = 0x4fc0052c;
++Cache_Travel_Tag_Memory = 0x4fc00530;
++Cache_Travel_Tag_Memory2 = 0x4fc00534;
++Cache_Get_Virtual_Addr = 0x4fc00538;
++Cache_Set_IDROM_MMU_Size = 0x4fc0053c;
++flash2spiram_instruction_offset = 0x4fc00540;
++flash2spiram_rodata_offset = 0x4fc00544;
++flash_instr_rodata_start_page = 0x4fc00548;
++flash_instr_rodata_end_page = 0x4fc0054c;
++Cache_Set_IDROM_MMU_Info = 0x4fc00550;
++Cache_Get_IROM_MMU_End = 0x4fc00554;
++Cache_Get_DROM_MMU_End = 0x4fc00558;
++/* Data (.data, .bss, .rodata) */
++rom_cache_op_cb = 0x4ff3ffdc;
++rom_cache_internal_table_ptr = 0x4ff3ffd8;
++
++
++/***************************************
++ Group clock
++ ***************************************/
++
++/* Functions */
++ets_clk_get_xtal_freq = 0x4fc0055c;
++ets_clk_get_cpu_freq = 0x4fc00560;
++
++
++/***************************************
++ Group gpio
++ ***************************************/
++
++/* Functions */
++rom_gpio_set_output_level = 0x4fc00564;
++rom_gpio_get_input_level = 0x4fc00568;
++rom_gpio_matrix_in = 0x4fc0056c;
++rom_gpio_matrix_out = 0x4fc00570;
++rom_gpio_bypass_matrix_in = 0x4fc00574;
++rom_gpio_output_disable = 0x4fc00578;
++rom_gpio_output_enable = 0x4fc0057c;
++rom_gpio_pad_input_disable = 0x4fc00580;
++rom_gpio_pad_input_enable = 0x4fc00584;
++rom_gpio_pad_pulldown = 0x4fc00588;
++rom_gpio_pad_pullup = 0x4fc0058c;
++rom_gpio_pad_select_gpio = 0x4fc00590;
++rom_gpio_pad_set_drv = 0x4fc00594;
++rom_gpio_pad_unhold = 0x4fc00598;
++rom_gpio_pad_hold = 0x4fc0059c;
++rom_gpio_lppad_select_mux = 0x4fc005a0;
++rom_gpio_ded_pad_set_drv = 0x4fc005a4;
++rom_gpio_ded_pad_pullup = 0x4fc005a8;
++rom_gpio_ded_pad_pulldown = 0x4fc005ac;
++rom_gpio_ded_pad_hold = 0x4fc005b0;
++rom_gpio_ded_pad_unhold = 0x4fc005b4;
++
++
++/***************************************
++ Group interrupts
++ ***************************************/
++
++/* Functions */
++esprv_intc_int_set_priority = 0x4fc005b8;
++esprv_intc_int_set_threshold = 0x4fc005bc;
++esprv_intc_int_enable = 0x4fc005c0;
++esprv_intc_int_disable = 0x4fc005c4;
++PROVIDE( intr_handler_set = 0x4fc005cc );
++intr_matrix_set = 0x4fc005d0;
++ets_intr_lock = 0x4fc005d4;
++ets_intr_unlock = 0x4fc005d8;
++ets_isr_attach = 0x4fc005dc;
++ets_isr_mask = 0x4fc005e0;
++ets_isr_unmask = 0x4fc005e4;
++
++
++/***************************************
++ Group crypto
++ ***************************************/
++
++/* Functions */
++md5_vector = 0x4fc005e8;
++MD5Init = 0x4fc005ec;
++MD5Update = 0x4fc005f0;
++MD5Final = 0x4fc005f4;
++crc32_le = 0x4fc005f8;
++crc16_le = 0x4fc005fc;
++crc8_le = 0x4fc00600;
++crc32_be = 0x4fc00604;
++crc16_be = 0x4fc00608;
++crc8_be = 0x4fc0060c;
++esp_crc8 = 0x4fc00610;
++ets_sha_enable = 0x4fc00614;
++ets_sha_disable = 0x4fc00618;
++ets_sha_get_state = 0x4fc0061c;
++ets_sha_init = 0x4fc00620;
++ets_sha_process = 0x4fc00624;
++ets_sha_starts = 0x4fc00628;
++ets_sha_update = 0x4fc0062c;
++ets_sha_finish = 0x4fc00630;
++ets_sha_clone = 0x4fc00634;
++ets_hmac_enable = 0x4fc00638;
++ets_hmac_disable = 0x4fc0063c;
++ets_hmac_calculate_message = 0x4fc00640;
++ets_hmac_calculate_downstream = 0x4fc00644;
++ets_hmac_invalidate_downstream = 0x4fc00648;
++ets_jtag_enable_temporarily = 0x4fc0064c;
++ets_aes_enable = 0x4fc00650;
++ets_aes_disable = 0x4fc00654;
++ets_aes_setkey = 0x4fc00658;
++ets_aes_block = 0x4fc0065c;
++ets_aes_setkey_dec = 0x4fc00660;
++ets_aes_setkey_enc = 0x4fc00664;
++ets_bigint_enable = 0x4fc00668;
++ets_bigint_disable = 0x4fc0066c;
++ets_bigint_multiply = 0x4fc00670;
++ets_bigint_modmult = 0x4fc00674;
++ets_bigint_modexp = 0x4fc00678;
++ets_bigint_wait_finish = 0x4fc0067c;
++ets_bigint_getz = 0x4fc00680;
++ets_ds_enable = 0x4fc00684;
++ets_ds_disable = 0x4fc00688;
++ets_ds_start_sign = 0x4fc0068c;
++ets_ds_is_busy = 0x4fc00690;
++ets_ds_finish_sign = 0x4fc00694;
++ets_ds_encrypt_params = 0x4fc00698;
++ets_mgf1_sha256 = 0x4fc0069c;
++/* Data (.data, .bss, .rodata) */
++crc32_le_table_ptr = 0x4fc1fff8;
++crc16_le_table_ptr = 0x4fc1fff4;
++crc8_le_table_ptr = 0x4fc1fff0;
++crc32_be_table_ptr = 0x4fc1ffec;
++crc16_be_table_ptr = 0x4fc1ffe8;
++crc8_be_table_ptr = 0x4fc1ffe4;
++
++
++/***************************************
++ Group efuse
++ ***************************************/
++
++/* Functions */
++ets_efuse_read = 0x4fc006a0;
++ets_efuse_program = 0x4fc006a4;
++ets_efuse_clear_program_registers = 0x4fc006a8;
++ets_efuse_write_key = 0x4fc006ac;
++ets_efuse_get_read_register_address = 0x4fc006b0;
++ets_efuse_get_key_purpose = 0x4fc006b4;
++ets_efuse_key_block_unused = 0x4fc006b8;
++ets_efuse_find_unused_key_block = 0x4fc006bc;
++ets_efuse_rs_calculate = 0x4fc006c0;
++ets_efuse_count_unused_key_blocks = 0x4fc006c4;
++ets_efuse_secure_boot_enabled = 0x4fc006c8;
++ets_efuse_secure_boot_aggressive_revoke_enabled = 0x4fc006cc;
++ets_efuse_cache_encryption_enabled = 0x4fc006d0;
++ets_efuse_download_modes_disabled = 0x4fc006d4;
++ets_efuse_find_purpose = 0x4fc006d8;
++ets_efuse_force_send_resume = 0x4fc006dc;
++ets_efuse_get_flash_delay_us = 0x4fc006e0;
++ets_efuse_get_uart_print_control = 0x4fc006e4;
++ets_efuse_direct_boot_mode_disabled = 0x4fc006e8;
++ets_efuse_security_download_modes_enabled = 0x4fc006ec;
++ets_efuse_jtag_disabled = 0x4fc006f0;
++ets_efuse_usb_print_is_disabled = 0x4fc006f4;
++ets_efuse_usb_download_mode_disabled = 0x4fc006f8;
++ets_efuse_usb_device_disabled = 0x4fc006fc;
++ets_efuse_get_km_huk_gen_state = 0x4fc00700;
++ets_efuse_get_km_deploy_only_once = 0x4fc00704;
++ets_efuse_get_force_use_km_key = 0x4fc00708;
++ets_efuse_xts_key_length_256 = 0x4fc0070c;
++ets_efuse_get_km_key_lock = 0x4fc00710;
++
++
++/***************************************
++ Group key_mgr
++ ***************************************/
++
++/* Functions */
++esp_rom_check_recover_key = 0x4fc00714;
++esp_rom_km_huk_conf = 0x4fc00718;
++esp_rom_km_huk_risk = 0x4fc0071c;
++
++
++/***************************************
++ Group secureboot
++ ***************************************/
++
++/* Functions */
++ets_emsa_pss_verify = 0x4fc00720;
++ets_rsa_pss_verify = 0x4fc00724;
++_rom_ets_ecdsa_verify = 0x4fc00728;
++_rom_ets_secure_boot_verify_signature = 0x4fc00730;
++ets_secure_boot_read_key_digests = 0x4fc00734;
++ets_secure_boot_revoke_public_key_digest = 0x4fc00738;
++
++
++/***************************************
++ Group usb_device_uart
++ ***************************************/
++
++/* Functions */
++usb_serial_device_rx_one_char = 0x4fc008b0;
++usb_serial_device_rx_one_char_block = 0x4fc008b4;
++usb_serial_device_tx_flush = 0x4fc008b8;
++usb_serial_device_tx_one_char = 0x4fc008bc;
++
++
++/***************************************
++ Group usb_dwcotg_uart
++ ***************************************/
++
++/* Functions */
++Uart_Init_USB = 0x4fc008c0;
++usb_serial_otg_rx_one_char = 0x4fc008c4;
++usb_serial_otg_rx_one_char_block = 0x4fc008c8;
++usb_serial_otg_tx_flush = 0x4fc008cc;
++usb_serial_otg_tx_one_char = 0x4fc008d0;
++/* Data (.data, .bss, .rodata) */
++uart_acm_dev = 0x4ff3ffd4;
++
++
++/***************************************
++ Group usb_dwcotg_module
++ ***************************************/
++
++/* Functions */
++cdc_acm_class_handle_req = 0x4fc008d4;
++cdc_acm_init = 0x4fc008d8;
++cdc_acm_fifo_fill = 0x4fc008dc;
++cdc_acm_rx_fifo_cnt = 0x4fc008e0;
++cdc_acm_fifo_read = 0x4fc008e4;
++cdc_acm_irq_tx_enable = 0x4fc008e8;
++cdc_acm_irq_tx_disable = 0x4fc008ec;
++cdc_acm_irq_state_enable = 0x4fc008f0;
++cdc_acm_irq_state_disable = 0x4fc008f4;
++cdc_acm_irq_tx_ready = 0x4fc008f8;
++cdc_acm_irq_rx_enable = 0x4fc008fc;
++cdc_acm_irq_rx_disable = 0x4fc00900;
++cdc_acm_irq_rx_ready = 0x4fc00904;
++cdc_acm_irq_is_pending = 0x4fc00908;
++cdc_acm_irq_callback_set = 0x4fc0090c;
++cdc_acm_line_ctrl_set = 0x4fc00910;
++cdc_acm_line_ctrl_get = 0x4fc00914;
++cdc_acm_poll_out = 0x4fc00918;
++chip_usb_dw_did_persist = 0x4fc0091c;
++chip_usb_dw_init = 0x4fc00920;
++chip_usb_detach = 0x4fc00924;
++chip_usb_dw_prepare_persist = 0x4fc00928;
++chip_usb_get_persist_flags = 0x4fc0092c;
++chip_usb_set_persist_flags = 0x4fc00930;
++cpio_start = 0x4fc00934;
++cpio_feed = 0x4fc00938;
++cpio_done = 0x4fc0093c;
++cpio_destroy = 0x4fc00940;
++dfu_flash_init = 0x4fc00944;
++dfu_flash_erase = 0x4fc00948;
++dfu_flash_program = 0x4fc0094c;
++dfu_flash_read = 0x4fc00950;
++dfu_flash_attach = 0x4fc00954;
++dfu_cpio_callback = 0x4fc00958;
++dfu_updater_get_err = 0x4fc0095c;
++dfu_updater_clear_err = 0x4fc00960;
++dfu_updater_enable = 0x4fc00964;
++dfu_updater_begin = 0x4fc00968;
++dfu_updater_feed = 0x4fc0096c;
++dfu_updater_end = 0x4fc00970;
++dfu_updater_set_raw_addr = 0x4fc00974;
++dfu_updater_flash_read = 0x4fc00978;
++usb_dc_prepare_persist = 0x4fc0097c;
++usb_dw_isr_handler = 0x4fc00980;
++usb_dc_attach = 0x4fc00984;
++usb_dc_detach = 0x4fc00988;
++usb_dc_reset = 0x4fc0098c;
++usb_dc_set_address = 0x4fc00990;
++usb_dc_ep_check_cap = 0x4fc00994;
++usb_dc_ep_configure = 0x4fc00998;
++usb_dc_ep_set_stall = 0x4fc0099c;
++usb_dc_ep_clear_stall = 0x4fc009a0;
++usb_dc_ep_halt = 0x4fc009a4;
++usb_dc_ep_is_stalled = 0x4fc009a8;
++usb_dc_ep_enable = 0x4fc009ac;
++usb_dc_ep_disable = 0x4fc009b0;
++usb_dc_ep_flush = 0x4fc009b4;
++usb_dc_ep_write_would_block = 0x4fc009b8;
++usb_dc_ep_write = 0x4fc009bc;
++usb_dc_ep_read_wait = 0x4fc009c0;
++usb_dc_ep_read_continue = 0x4fc009c4;
++usb_dc_ep_read = 0x4fc009c8;
++usb_dc_ep_set_callback = 0x4fc009cc;
++usb_dc_set_status_callback = 0x4fc009d0;
++usb_dc_ep_mps = 0x4fc009d4;
++usb_dc_check_poll_for_interrupts = 0x4fc009d8;
++mac_addr_to_serial_str_desc = 0x4fc009dc;
++usb_set_current_descriptor = 0x4fc009e0;
++usb_get_descriptor = 0x4fc009e4;
++usb_dev_resume = 0x4fc009e8;
++usb_dev_get_configuration = 0x4fc009ec;
++usb_set_config = 0x4fc009f0;
++usb_deconfig = 0x4fc009f4;
++usb_enable = 0x4fc009f8;
++usb_disable = 0x4fc009fc;
++usb_write_would_block = 0x4fc00a00;
++usb_write = 0x4fc00a04;
++usb_read = 0x4fc00a08;
++usb_ep_set_stall = 0x4fc00a0c;
++usb_ep_clear_stall = 0x4fc00a10;
++usb_ep_read_wait = 0x4fc00a14;
++usb_ep_read_continue = 0x4fc00a18;
++usb_transfer_ep_callback = 0x4fc00a1c;
++usb_transfer = 0x4fc00a20;
++usb_cancel_transfer = 0x4fc00a24;
++usb_transfer_sync = 0x4fc00a28;
++usb_dfu_set_detach_cb = 0x4fc00a2c;
++dfu_class_handle_req = 0x4fc00a30;
++dfu_status_cb = 0x4fc00a34;
++dfu_custom_handle_req = 0x4fc00a38;
++usb_dfu_init = 0x4fc00a3c;
++usb_dfu_force_detach = 0x4fc00a40;
++usb_dev_deinit = 0x4fc00a44;
++usb_dw_ctrl_deinit = 0x4fc00a48;
++/* Data (.data, .bss, .rodata) */
++s_usb_osglue = 0x4ff3ffc8;
+diff --git a/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.libgcc.ld b/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.libgcc.ld
+new file mode 100644
+index 00000000..3b969ade
+--- /dev/null
++++ b/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.libgcc.ld
+@@ -0,0 +1,95 @@
++/*
++ * SPDX-FileCopyrightText: 2023-2025 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++/* ROM function interface esp32p4.rom.libgcc.ld for esp32p4
++ *
++ *
++ * Generated from ./target/esp32p4/interface-esp32p4.yml md5sum f6516bd9708d890f63db87f8aed53ca7
++ *
++ * Compatible with ROM where ECO version equal or greater to 0.
++ *
++ * THIS FILE WAS AUTOMATICALLY GENERATED. DO NOT EDIT.
++ */
++
++/***************************************
++ Group libgccdf
++ ***************************************/
++
++/* Functions */
++__absvdi2 = 0x4fc0073c;
++__absvsi2 = 0x4fc00740;
++__adddf3 = 0x4fc00744;
++__addvdi3 = 0x4fc00748;
++__addvsi3 = 0x4fc0074c;
++__ashldi3 = 0x4fc00750;
++__ashrdi3 = 0x4fc00754;
++__bswapdi2 = 0x4fc00758;
++__bswapsi2 = 0x4fc0075c;
++__clear_cache = 0x4fc00760;
++__clrsbdi2 = 0x4fc00764;
++__clrsbsi2 = 0x4fc00768;
++__clzdi2 = 0x4fc0076c;
++__clzsi2 = 0x4fc00770;
++__cmpdi2 = 0x4fc00774;
++__ctzdi2 = 0x4fc00778;
++__ctzsi2 = 0x4fc0077c;
++__divdc3 = 0x4fc00780;
++__divdf3 = 0x4fc00784;
++__divdi3 = 0x4fc00788;
++__divsc3 = 0x4fc0078c;
++__divsi3 = 0x4fc00790;
++__eqdf2 = 0x4fc00794;
++__extendsfdf2 = 0x4fc00798;
++__ffsdi2 = 0x4fc0079c;
++__ffssi2 = 0x4fc007a0;
++__fixdfdi = 0x4fc007a4;
++__fixdfsi = 0x4fc007a8;
++__fixsfdi = 0x4fc007ac;
++__fixunsdfsi = 0x4fc007b0;
++__fixunssfdi = 0x4fc007b4;
++__fixunssfsi = 0x4fc007b8;
++__floatdidf = 0x4fc007bc;
++__floatdisf = 0x4fc007c0;
++__floatsidf = 0x4fc007c4;
++__floatundidf = 0x4fc007c8;
++__floatundisf = 0x4fc007cc;
++__floatunsidf = 0x4fc007d0;
++__gcc_bcmp = 0x4fc007d4;
++__gedf2 = 0x4fc007d8;
++__gtdf2 = 0x4fc007dc;
++__ledf2 = 0x4fc007e0;
++__lshrdi3 = 0x4fc007e4;
++__ltdf2 = 0x4fc007e8;
++__moddi3 = 0x4fc007ec;
++__modsi3 = 0x4fc007f0;
++__muldc3 = 0x4fc007f4;
++__muldf3 = 0x4fc007f8;
++__muldi3 = 0x4fc007fc;
++__mulsc3 = 0x4fc00800;
++__mulsi3 = 0x4fc00804;
++__mulvdi3 = 0x4fc00808;
++__mulvsi3 = 0x4fc0080c;
++__nedf2 = 0x4fc00810;
++__negdf2 = 0x4fc00814;
++__negdi2 = 0x4fc00818;
++__negvdi2 = 0x4fc0081c;
++__negvsi2 = 0x4fc00820;
++__paritysi2 = 0x4fc00824;
++__popcountdi2 = 0x4fc00828;
++__popcountsi2 = 0x4fc0082c;
++__powidf2 = 0x4fc00830;
++__subdf3 = 0x4fc00834;
++__subvdi3 = 0x4fc00838;
++__subvsi3 = 0x4fc0083c;
++__ucmpdi2 = 0x4fc00840;
++__udivdi3 = 0x4fc00844;
++__udivmoddi4 = 0x4fc00848;
++__udivsi3 = 0x4fc0084c;
++__udiv_w_sdiv = 0x4fc00850;
++__umoddi3 = 0x4fc00854;
++__umodsi3 = 0x4fc00858;
++__unorddf2 = 0x4fc0085c;
++__extenddftf2 = 0x4fc00860;
++__trunctfdf2 = 0x4fc00864;
+diff --git a/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.rvfp.ld b/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.rvfp.ld
+new file mode 100644
+index 00000000..bb28d141
+--- /dev/null
++++ b/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.rvfp.ld
+@@ -0,0 +1,116 @@
++/*
++ * SPDX-FileCopyrightText: 2023-2025 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++/* ROM function interface esp32p4.rom.rvfp.ld for esp32p4
++ *
++ *
++ * Generated from ./target/esp32p4/interface-esp32p4.yml md5sum f6516bd9708d890f63db87f8aed53ca7
++ *
++ * Compatible with ROM where ECO version equal or greater to 0.
++ *
++ * THIS FILE WAS AUTOMATICALLY GENERATED. DO NOT EDIT.
++ */
++
++/***************************************
++ Group rvfplibdf
++ ***************************************/
++/*
++ * These functions cannot work when compiling with floating point ABI
++ * implementation assumes argument is passed in a0, but floats will be passed
++ * in the floating point registers instead
++ *
++ * __fixsfdi = 0x4fc00878;
++ * __fixunssfdi = 0x4fc00880;
++ */
++
++/* Functions */
++__adddf3 = 0x4fc00868;
++__eqdf2 = 0x4fc0086c;
++__fixdfdi = 0x4fc00870;
++__fixdfsi = 0x4fc00874;
++__fixunsdfsi = 0x4fc0087c;
++__floatdidf = 0x4fc00884;
++__floatsidf = 0x4fc00888;
++__floatundidf = 0x4fc0088c;
++__floatunsidf = 0x4fc00890;
++__gedf2 = 0x4fc00894;
++__gtdf2 = 0x4fc00898;
++__ledf2 = 0x4fc0089c;
++__ltdf2 = 0x4fc008a0;
++__muldf3 = 0x4fc008a4;
++__nedf2 = 0x4fc008a8;
++__subdf3 = 0x4fc008ac;
++
++/***************************************
++ Group libgcc
++***************************************/
++
++/* Not part of the original ROM interface, but RVFP versions cannot work with float-abi */
++__fixsfdi = 0x4fc007ac;
++__fixunssfdi = 0x4fc007b4;
++
++/* Functions */
++__absvdi2 = 0x4fc0073c;
++__absvsi2 = 0x4fc00740;
++__addvdi3 = 0x4fc00748;
++__addvsi3 = 0x4fc0074c;
++__ashldi3 = 0x4fc00750;
++__ashrdi3 = 0x4fc00754;
++__bswapdi2 = 0x4fc00758;
++__bswapsi2 = 0x4fc0075c;
++__clear_cache = 0x4fc00760;
++__clrsbdi2 = 0x4fc00764;
++__clrsbsi2 = 0x4fc00768;
++__clzdi2 = 0x4fc0076c;
++__clzsi2 = 0x4fc00770;
++__cmpdi2 = 0x4fc00774;
++__ctzdi2 = 0x4fc00778;
++__ctzsi2 = 0x4fc0077c;
++__divdc3 = 0x4fc00780;
++__divdf3 = 0x4fc00784;
++__divdi3 = 0x4fc00788;
++__divsc3 = 0x4fc0078c;
++__divsi3 = 0x4fc00790;
++__extendsfdf2 = 0x4fc00798;
++__ffsdi2 = 0x4fc0079c;
++__ffssi2 = 0x4fc007a0;
++__fixunssfsi = 0x4fc007b8;
++__floatdisf = 0x4fc007c0;
++__floatundisf = 0x4fc007cc;
++__gcc_bcmp = 0x4fc007d4;
++__lshrdi3 = 0x4fc007e4;
++__moddi3 = 0x4fc007ec;
++__modsi3 = 0x4fc007f0;
++__muldc3 = 0x4fc007f4;
++__muldi3 = 0x4fc007fc;
++__mulsc3 = 0x4fc00800;
++__mulsi3 = 0x4fc00804;
++__mulvdi3 = 0x4fc00808;
++__mulvsi3 = 0x4fc0080c;
++__negdf2 = 0x4fc00814;
++__negdi2 = 0x4fc00818;
++__negvdi2 = 0x4fc0081c;
++__negvsi2 = 0x4fc00820;
++__paritysi2 = 0x4fc00824;
++__popcountdi2 = 0x4fc00828;
++__popcountsi2 = 0x4fc0082c;
++__powidf2 = 0x4fc00830;
++__subvdi3 = 0x4fc00838;
++__subvsi3 = 0x4fc0083c;
++__ucmpdi2 = 0x4fc00840;
++__udivdi3 = 0x4fc00844;
++__udivmoddi4 = 0x4fc00848;
++__udivsi3 = 0x4fc0084c;
++__udiv_w_sdiv = 0x4fc00850;
++__umoddi3 = 0x4fc00854;
++__umodsi3 = 0x4fc00858;
++__unorddf2 = 0x4fc0085c;
++__extenddftf2 = 0x4fc00860;
++__trunctfdf2 = 0x4fc00864;
++/***************************************
++ Group libgcc
++***************************************/
++
++/* Functions */
+diff --git a/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.version.ld b/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.version.ld
+new file mode 100644
+index 00000000..9a5970bc
+--- /dev/null
++++ b/esp-rom-sys/ld/esp32p4-eco0_4/rom/esp32p4.rom.version.ld
+@@ -0,0 +1,13 @@
++/*
++ * SPDX-FileCopyrightText: 2023 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++/* ROM version variables for esp32p4
++ *
++ * These addresses should be compatible with any ROM version for this chip.
++ *
++ * THIS FILE WAS AUTOMATICALLY GENERATED. DO NOT EDIT.
++ */
++_rom_chip_id = 0x4fc00010;
++_rom_eco_version = 0x4fc00014;
+diff --git a/esp-sync/Cargo.toml b/esp-sync/Cargo.toml
+index d770bf52..8feb3935 100644
+--- a/esp-sync/Cargo.toml
++++ b/esp-sync/Cargo.toml
+@@ -38,6 +38,7 @@ xtensa-lx        = { version = "0.13.0", path = "../xtensa-lx" }
+ 
+ [build-dependencies]
+ esp-metadata-generated = { version = "0.4.0", path = "../esp-metadata-generated", features = ["build-script"] }
++esp-config = { version = "0.7.0", path = "../esp-config", features = ["build"] }
+ 
+ [features]
+ #! ### Chip Support Feature Flags
+diff --git a/esp-sync/build.rs b/esp-sync/build.rs
+index e55f71a4..1cee714e 100644
+--- a/esp-sync/build.rs
++++ b/esp-sync/build.rs
+@@ -1,9 +1,31 @@
+ use std::error::Error;
+ 
++use esp_config::generate_config_from_yaml_definition;
++
+ fn main() -> Result<(), Box<dyn Error>> {
+     // Define all necessary configuration symbols for the configured device:
+     let chip = esp_metadata_generated::Chip::from_cargo_feature()?;
+     chip.define_cfgs();
+ 
++    // Derive `esp32p4_rev_lt_v3` from the configured minimum chip revision: pre-v3.0
++    // ESP32-P4 lacks the `mintthresh` CSR the Zcmp critical-section workaround writes
++    // (0x347 traps). Compile-time, since the workaround runs in hot/early paths.
++    println!("cargo:rerun-if-changed=./esp_config.yml");
++    let cfg_yaml = std::fs::read_to_string("./esp_config.yml")
++        .expect("Failed to read esp_config.yml for esp-sync");
++    let cfg = generate_config_from_yaml_definition(&cfg_yaml, true, true, Some(chip)).unwrap();
++
++    println!("cargo:rustc-check-cfg=cfg(esp32p4_rev_lt_v3)");
++    if chip.name() == "esp32p4" {
++        let min_rev = cfg
++            .iter()
++            .find(|(k, _)| k.to_ascii_lowercase().ends_with("min_chip_revision"))
++            .map(|(_, v)| v.as_integer())
++            .unwrap_or(0);
++        if min_rev < 300 {
++            println!("cargo:rustc-cfg=esp32p4_rev_lt_v3");
++        }
++    }
++
+     Ok(())
+ }
+diff --git a/esp-sync/esp_config.yml b/esp-sync/esp_config.yml
+new file mode 100644
+index 00000000..9eed1eff
+--- /dev/null
++++ b/esp-sync/esp_config.yml
+@@ -0,0 +1,15 @@
++crate: esp-sync
++
++options:
++  - name: min-chip-revision
++    description: "The minimum chip revision the application targets, in format:
++      major * 100 + minor. On ESP32-P4, revisions below v3.0 (< 300) lack the `mintthresh`
++      CSR (writing 0x347 traps illegal-instruction), so the Zcmp critical-section workaround
++      is disabled there. Defaults to 300 (v3.0) on ESP32-P4 — set it to your silicon
++      revision (e.g. 100 for v1.0) on older parts. Keep in sync with the esp-hal option of
++      the same name. Mirrors ESP-IDF `CONFIG_ESP32P4_SELECTS_REV_LESS_V3`."
++    default:
++      - value: 300
++        if: 'chip == "esp32p4"'
++      - value: 0
++    active: 'chip == "esp32p4"'
+diff --git a/esp-sync/src/raw.rs b/esp-sync/src/raw.rs
+index 778caabd..79508572 100644
+--- a/esp-sync/src/raw.rs
++++ b/esp-sync/src/raw.rs
+@@ -35,7 +35,7 @@ impl RawLock for SingleCoreInterruptLock {
+     #[inline]
+     unsafe fn enter(&self) -> RestoreState {
+         cfg_if::cfg_if! {
+-            if #[cfg(esp32p4)] { // TODO: any with zcmp
++            if #[cfg(all(esp32p4, not(esp32p4_rev_lt_v3)))] { // TODO: any with zcmp
+                 // ESP32-P4 (v3.2/ECO7 etc.) Zcmp hardware bug workaround (IDF-14279 / DIG-661):
+                 // Clearing mstatus.mie alone does not fully mask CLIC interrupts -- an
+                 // interrupt can still fire mid-instruction on cm.push (and possibly on
+@@ -43,6 +43,10 @@ impl RawLock for SingleCoreInterruptLock {
+                 // while mie is cleared, then restore the previous mintthresh on exit.
+                 // Ref: esp-idf commit c27c33a83 "fix(riscv): implement a workaround for
+                 // Zcmp hardware bug".
++                //
++                // Disabled on pre-v3.0 ESP32-P4 (`esp32p4-rev-lt-v3`): those revisions have no
++                // `mintthresh` CSR — writing 0x347 traps illegal-instruction. Mirrors IDF
++                // `CONFIG_ESP32P4_SELECTS_REV_LESS_V3`.
+                 let old_mintthresh: u32;
+                 unsafe {
+                     core::arch::asm!(
+@@ -86,7 +90,7 @@ impl RawLock for SingleCoreInterruptLock {
+         let token = token.inner();
+ 
+         cfg_if::cfg_if! {
+-            if #[cfg(esp32p4)] {
++            if #[cfg(all(esp32p4, not(esp32p4_rev_lt_v3)))] {
+                 if (token & 0b1000) != 0 {
+                     unsafe {
+                         riscv::interrupt::enable();

@@ -1,0 +1,16 @@
+{
+  "upstream": {
+    "repository": "https://github.com/esp-rs/esp-hal.git",
+    "revision": "e02f3613e9f9ba1ce00070eb387e3bf4fde2267b"
+  },
+  "patch": {
+    "path": "patches/esp32p4-pre-v3.patch",
+    "sha256": "fa42949ad7294bfe15807aa67f0fabcf93aa36bd8d1507e45e0210fa0d51c874"
+  },
+  "cargo_patches": [
+    "esp-hal",
+    "esp-backtrace",
+    "esp-bootloader-esp-idf",
+    "esp-println"
+  ]
+}

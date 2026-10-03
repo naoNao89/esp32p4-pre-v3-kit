@@ -1,0 +1,10 @@
+[package]
+name = "esp-hal-p4-pre-v3-kit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[[bin]]
+name = "xtask"
+path = "xtask.rs"
