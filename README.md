@@ -4,26 +4,33 @@ This kit contains a source patch and a preparation tool for pre-v3 ESP32-P4 supp
 
 ## Prepare the source
 
-Prerequisites: Rust 1.95 or newer, Python 3.9 or newer, and Git.
+Prerequisites: Rust 1.95 or newer, and Git.
 
-For example, keep the kit, application, and generated source in sibling directories:
+For example, keep your application and the generated source in sibling directories:
 
 ```text
 work/
-├── esp32p4-pre-v3-kit/
 ├── app/
 └── prepared/                 # created by the command
 ```
 
-From the kit root, run:
+Install the CLI tool:
 
 ```sh
-cargo xtask prepare ../prepared
+cargo install cargo-esp32p4-pre-v3
 ```
 
-The tool fetches the exact upstream `esp-hal` base revision `e02f3613e9f9ba1ce00070eb387e3bf4fde2267b`, applies the bundled patch, and places the checkout at `../prepared/upstream`. It also writes `../prepared/Cargo.patch.toml` with the Cargo path overrides. Relative destinations resolve from your current directory. The destination's parent directory must exist, and the destination itself must not already exist. The tool does not overwrite existing directories or use a shared source cache.
+Then from the `work` directory (alongside `app`), run the prepare command:
 
-Merge the `[patch.crates-io]` entries from `../prepared/Cargo.patch.toml` into the application's workspace-root `Cargo.toml` (merge with an existing table if needed). The generated entries use absolute paths. For the sibling-directory layout above, the equivalent relative paths are:
+```sh
+cargo esp32p4-pre-v3 prepare ./prepared
+```
+
+For local development within the kit repository, use `cargo run -- prepare ../prepared`.
+
+The tool fetches the exact upstream `esp-hal` base revision `e02f3613e9f9ba1ce00070eb387e3bf4fde2267b` via Git, applies the embedded patch, and places the checkout at `./prepared/upstream`. It also writes `./prepared/Cargo.patch.toml` with the Cargo path overrides. Relative destinations resolve from your current directory. The destination's parent directory must exist, and the destination itself must not already exist. The tool does not overwrite existing directories or use a shared source cache. The patch and base manifest are embedded directly in the single Rust binary; an original kit checkout or Python setup is not required after installation.
+
+Merge the `[patch.crates-io]` entries from `./prepared/Cargo.patch.toml` into the application's workspace-root `Cargo.toml` (merge with an existing table if needed). The generated entries use absolute paths. For the sibling-directory layout above, the equivalent relative paths are:
 
 ```toml
 [patch.crates-io]
@@ -74,16 +81,15 @@ If unset, the revision strictly defaults to `300` (v3+), which will not run on p
 From the kit root:
 
 ```sh
-cargo xtask host-tests
-cargo xtask fmt-packages -- --check
-cargo xtask lint-packages
-python3 tests/check_consumer.py --revision 103 --destination target/consumer-103
-python3 tests/check_consumer.py --revision 300 --destination target/consumer-300
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo test --test consumer -- --ignored --test-threads=1
+cargo package --list
+cargo publish --dry-run
 ```
 
-Consumer checks require the RISC-V target, network access, and `llvm-objdump` (`rustup component add llvm-tools-preview`, or Xcode's `xcrun llvm-objdump`). Each destination must be new; the checks refuse to overwrite an existing path. CI runs these same host and consumer checks.
-
-`xtask` uses the executable specified by `PYTHON`, or discovers `python3`, `python`, then the Windows `py -3` launcher. Set `PYTHON` to a Python 3.9+ executable if the default interpreter is unsuitable.
+Consumer checks are run as an ignored test and require the RISC-V target, network access, and `llvm-objdump` (`rustup component add llvm-tools-preview`). CI runs these same host and consumer checks, as well as a dry-run check of the package structure (`publish --dry-run` performs validation only; no actual publication occurs). If testing packaging with uncommitted changes locally, append `--allow-dirty` to both the `cargo package` and `cargo publish` commands.
 
 ## Scope and limits
 

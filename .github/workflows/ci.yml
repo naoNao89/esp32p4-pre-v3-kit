@@ -20,22 +20,20 @@ jobs:
           rustup default 1.95.0
           rustup target add riscv32imafc-unknown-none-elf
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.9'
-
       - name: Cargo fmt
-        run: cargo xtask fmt-packages -- --check
+        run: cargo fmt --check
 
       - name: Clippy
-        run: cargo xtask lint-packages
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Host Tests
-        run: cargo xtask host-tests
+        run: cargo test
 
-      - name: Test Consumer 103
-        run: python3 tests/check_consumer.py --revision 103 --destination target/consumer-103
+      - name: Consumer Tests
+        run: cargo test --test consumer -- --ignored --test-threads=1
 
-      - name: Test Consumer 300
-        run: python3 tests/check_consumer.py --revision 300 --destination target/consumer-300
+      - name: Package List
+        run: cargo package --list
+
+      - name: Publish Dry-Run
+        run: cargo publish --dry-run
