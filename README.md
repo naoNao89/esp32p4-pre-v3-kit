@@ -121,6 +121,8 @@ Output used USB Serial/JTAG, not peripheral UART. The capture contains a USB-UAR
 
 On the same v1.3 board, five complete runs passed on 2026-10-03: CPU profiles 90 MHz (one run), 180 MHz (one run), and 360 MHz (three runs, including two reset-only repeats). Whole-ELF disassembly found no CSR `0x347` instructions in any of the three clock-profile images.
 
+For the preserved source fixture and manual reproduction commands, see [tests/hil-hardware-deep](tests/hil-hardware-deep/README.md).
+
 With Rust 1.98.1, local ThinLTO compilation of the second-core `fscsr` trampoline failed; the diagnostic release profile used `lto = "off"`. The SDK and compatibility patch were not modified.
 
 Raw evidence remains outside this repository in the local `ESP32P4-backups` directory. The result manifest is `80f1b2d06a6f-deep-20261003-235336-results.json`; matching logs and source/image archives use the same filename prefix.

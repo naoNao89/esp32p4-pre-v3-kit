@@ -1,0 +1,12 @@
+[target.riscv32imafc-unknown-none-elf]
+rustflags = [
+  "-C", "link-arg=-Tlinkall.x",
+  "-C", "force-frame-pointers",
+]
+
+[build]
+target = "riscv32imafc-unknown-none-elf"
+target-dir = "../../target/hil-hardware-deep-build-90"
+
+[env]
+ESP_HAL_CONFIG_MIN_CHIP_REVISION = "103"
