@@ -652,9 +652,12 @@ fn dependency_package<'a>(
 ) -> Result<Option<&'a Package>> {
     if let Some(path) = &dependency.path {
         let manifest = io(path.join("Cargo.toml").canonicalize())?;
-        let mut found = packages
-            .iter()
-            .filter(|p| p.name == dependency.name && p.manifest_path == manifest);
+        let mut found = packages.iter().filter(|p| {
+            p.name == dependency.name
+                && Path::new(&p.manifest_path)
+                    .canonicalize()
+                    .is_ok_and(|candidate| candidate == manifest)
+        });
         if let Some(package) = found.next()
             && found.next().is_none()
         {
@@ -1064,7 +1067,11 @@ pub fn distribute(prepared: &Path, metadata_json: &Path, destination: &Path) -> 
                         package.id, package.source
                     )
                 })?;
-            let checkout = PathBuf::from(git(&package_dir, &["rev-parse", "--show-toplevel"])?);
+            let checkout = io(PathBuf::from(git(
+                &package_dir,
+                &["rev-parse", "--show-toplevel"],
+            )?)
+            .canonicalize())?;
             if package_dir != checkout.join(&package.name)
                 || git(&checkout, &["rev-parse", "HEAD"])? != allowed_pin.2
             {

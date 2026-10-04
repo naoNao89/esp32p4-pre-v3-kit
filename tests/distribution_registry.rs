@@ -6,6 +6,8 @@
 //! prepares a fresh pinned checkout; no old baseline is silently reused.
 //! Requires python3, tar, network access, and the installed RISC-V Rust target.
 //! Evidence and command logs survive errors under target/distribution-validation/registry-proof-*.
+//! Five isolated registry-only consumers (PROFILES) share one union-feature
+//! distribution closure; per-profile evidence is namespaced by profile slug.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -36,6 +38,54 @@ fn proof_handler() {}
 #[esp_hal::ram(unstable(rtc_fast, zeroed))]
 static PROOF_RTC_ZEROED: u32 = 0;
 "#;
+const DEFMT_LOGGER_STUB: &str = r#"#[allow(dead_code)]
+#[defmt::global_logger]
+struct ProofDefmtLogger;
+
+unsafe impl defmt::Logger for ProofDefmtLogger {
+    fn acquire() {}
+    unsafe fn release() {}
+    unsafe fn write(_bytes: &[u8]) {}
+    unsafe fn flush() {}
+}
+
+// defmt 1.x calls this provider on every frame header
+// (`extern "Rust" fn _defmt_timestamp(_: Formatter<'_>)` in
+// defmt::export). A zero timestamp links the firmware with no transport.
+#[unsafe(no_mangle)]
+fn _defmt_timestamp(_: defmt::Formatter<'_>) {}
+// `defmt::panic!` (used by HAL/esp-sync internals under the `defmt`
+// feature) calls `extern "Rust" fn _defmt_panic() -> !`, normally provided
+// by a backend like panic-probe. Spin-loop like the firmware panic handler.
+#[unsafe(no_mangle)]
+fn _defmt_panic() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+"#;
+
+// HAL build.rs forbids log-04 + defmt together (mutually exclusive
+// logging backends), so no single feature set can union both. The
+// generator input uses the defmt side, which pulls strictly more
+// dependencies; log-04 is covered as its own profile (its only extra
+// dependency is the registry `log` crate).
+const UNION_FEATURES: &[&str] = &["esp32p4", "critical-section", "unstable", "defmt"];
+const PROFILES: &[(&str, &[&str], bool)] = &[
+    ("baseline-esp32p4", &["esp32p4"], false),
+    (
+        "unstable-critical-section",
+        &["esp32p4", "critical-section", "unstable"],
+        true,
+    ),
+    ("log-04", &["esp32p4", "log-04"], false),
+    ("defmt", &["esp32p4", "defmt"], false),
+    (
+        "max",
+        &["esp32p4", "critical-section", "unstable", "defmt"],
+        true,
+    ),
+];
 
 // Every child gets its own process group, including Cargo's rustc/build-script
 // descendants. Unwinding and deadlines terminate the entire group.
@@ -208,11 +258,16 @@ fn tree_hash(inventory: &BTreeMap<String, String>) -> String {
     }
     format!("{:x}", digest.finalize())
 }
-fn consumer(directory: &Path, dependency: &str) {
-    consumer_features(directory, dependency, &["esp32p4"], false);
-}
 fn consumer_features(directory: &Path, dependency: &str, features: &[&str], macros: bool) {
-    let features = serde_json::to_string(features).unwrap();
+    let features_json = serde_json::to_string(features).unwrap();
+    // HAL `defmt` logging needs a global logger at link time
+    // (`_defmt_acquire`). A local no-op stub links without any transport
+    // backend. The `defmt` edge is required so the stub's `defmt::` paths
+    // resolve, but it adds no new foreign package: `defmt` is already a
+    // resolved foreign crate via esp-hal's own optional dependency, and
+    // Cargo unifies both edges onto that single version.
+    let defmt_logger = features.contains(&"defmt");
+    let logger_dependency = if defmt_logger { "\ndefmt = \"1\"" } else { "" };
     fs::create_dir_all(directory.join("src")).unwrap();
     fs::write(
         directory.join("Cargo.toml"),
@@ -225,18 +280,24 @@ publish = false
 [workspace]
 resolver = "3"
 [dependencies]
-esp-hal = {{ {dependency}, features = {features} }}
+esp-hal = {{ {dependency}, features = {features_json} }}{logger_dependency}
 [profile.release]
 lto = "off"
 "#
         ),
     )
     .unwrap();
-    let source = if macros {
-        format!("{FIRMWARE}\n{MACRO_COVERAGE}")
-    } else {
-        FIRMWARE.to_owned()
-    };
+    let mut source = String::new();
+    source.push_str(FIRMWARE);
+    if defmt_logger {
+        // Items must follow the crate-level inner attributes at the top of
+        // FIRMWARE; emitting the stub first made `#![no_std]` illegal.
+        source.push_str(DEFMT_LOGGER_STUB);
+    }
+    if macros {
+        source.push('\n');
+        source.push_str(MACRO_COVERAGE);
+    }
     fs::write(directory.join("src/main.rs"), source).unwrap();
 }
 fn home(directory: &Path, index: Option<&str>) {
@@ -1094,31 +1155,38 @@ fn build_units(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn supplemental_macro_proof(
+fn verify_registry_profile(
     proof: &mut Proof,
+    slug: &str,
+    features: &[&str],
+    macros: bool,
     prepared: &Path,
     hal: &Value,
     mappings: &[Value],
     archives: &[Value],
     work: &Path,
     index: &str,
-    primary: &Value,
-) {
-    let baseline = work.join("supplemental-baseline-consumer");
-    let registry = work.join("supplemental-registry-consumer");
-    let baseline_home = work.join("supplemental-baseline-home");
-    let registry_home = work.join("supplemental-registry-home");
+    frozen_lock: &Path,
+    primary_contract: Option<&Value>,
+) -> Value {
+    // Every profile gets isolated scratch: its own baseline/registry consumer
+    // directories (hence isolated TARGET_DIRs) and its own CARGO_HOMEs, all on
+    // the same target, chip revision floor, resolver, and LTO setting.
+    let baseline = work.join(format!("{slug}-baseline-consumer"));
+    let registry = work.join(format!("{slug}-registry-consumer"));
+    let baseline_home = work.join(format!("{slug}-baseline-home"));
+    let registry_home = work.join(format!("{slug}-registry-home"));
     home(&baseline_home, None);
     home(&registry_home, Some(index));
-    let features = ["esp32p4", "critical-section", "unstable"];
+    assert!(!registry_home.join("registry").exists() && !registry_home.join("git").exists());
     consumer_features(
         &baseline,
         &format!(
             "path = {}",
             serde_json::to_string(&prepared.join("upstream/esp-hal")).unwrap()
         ),
-        &features,
-        true,
+        features,
+        macros,
     );
     consumer_features(
         &registry,
@@ -1127,60 +1195,130 @@ fn supplemental_macro_proof(
             serde_json::to_string(&hal["name"]).unwrap(),
             serde_json::to_string(&format!("={}", text(hal, "version"))).unwrap()
         ),
-        &features,
-        true,
+        features,
+        macros,
     );
-    fs::copy(
-        work.join("baseline-consumer/Cargo.lock"),
-        baseline.join("Cargo.lock"),
-    )
-    .unwrap();
+    // Isolated-consumer contract: resolver 3, LTO off, no overrides; the
+    // registry side additionally declares no checkout dependencies.
+    for (directory, registry_only) in [(&baseline, false), (&registry, true)] {
+        let input = manifest(&directory.join("Cargo.toml"));
+        assert!(
+            input.get("patch").is_none() && input.get("replace").is_none(),
+            "{slug}: consumer carries dependency overrides"
+        );
+        assert_eq!(
+            input["workspace"]["resolver"], "3",
+            "{slug}: consumer resolver drifted"
+        );
+        assert_eq!(
+            input["profile"]["release"]["lto"], "off",
+            "{slug}: consumer LTO drifted"
+        );
+        if registry_only {
+            for (_, _, dependencies) in dependency_tables(&input) {
+                for dependency in dependencies.values() {
+                    assert!(
+                        dependency.get("path").is_none() && dependency.get("git").is_none(),
+                        "{slug}: registry consumer declares a checkout dependency: {dependency}"
+                    );
+                }
+            }
+        }
+    }
+    fs::copy(frozen_lock, baseline.join("Cargo.lock")).unwrap();
     let baseline_graph = proof.metadata(
-        "supplemental-baseline-graph",
+        &format!("{slug}-baseline-graph"),
         &baseline,
         &baseline_home,
         false,
     );
     seed_registry_lock(
         proof,
-        "supplemental-registry",
+        &format!("{slug}-registry"),
         &baseline.join("Cargo.lock"),
         &registry,
         mappings,
         archives,
     );
     let registry_graph = proof.metadata(
-        "supplemental-registry-graph",
+        &format!("{slug}-registry-graph"),
         &registry,
         &registry_home,
         false,
     );
+    // Per-profile closure accounting: every resolved non-root package is
+    // either inside the SAME distribution closure or an explicitly accepted
+    // foreign crates.io package. No path/git/null-source leakage.
+    let baseline_root = baseline_graph["resolve"]["root"].as_str().unwrap();
+    let mut baseline_foreign = BTreeSet::new();
+    for package in array(&baseline_graph["packages"]) {
+        if package["id"].as_str() == Some(baseline_root) {
+            continue;
+        }
+        if matching_distribution(package, mappings).is_some() {
+            continue;
+        }
+        assert!(
+            package["source"]
+                .as_str()
+                .is_some_and(|source| source.starts_with("registry+")),
+            "{slug}: baseline resolved a non-registry foreign package: {package}"
+        );
+        baseline_foreign.insert(format!(
+            "{}@{}",
+            package["name"].as_str().unwrap(),
+            package["version"].as_str().unwrap()
+        ));
+    }
+    let registry_root = registry_graph["resolve"]["root"].as_str().unwrap();
+    let mut registry_foreign = BTreeSet::new();
+    let mut generated = Vec::new();
     for package in array(&registry_graph["packages"]) {
-        if package["id"] == registry_graph["resolve"]["root"] {
+        if package["id"].as_str() == Some(registry_root) {
             continue;
         }
         assert_eq!(
-            package["source"],
-            "registry+https://github.com/rust-lang/crates.io-index"
+            package["source"], "registry+https://github.com/rust-lang/crates.io-index",
+            "{slug}: registry-only consumer has non-default registry/path/Git source: {package}"
         );
+        if mappings.iter().any(|mapping| {
+            mapping["name"] == package["name"] && mapping["version"] == package["version"]
+        }) {
+            generated.push(package["name"].as_str().unwrap().to_owned());
+            continue;
+        }
+        registry_foreign.insert(format!(
+            "{}@{}",
+            package["name"].as_str().unwrap(),
+            package["version"].as_str().unwrap()
+        ));
     }
+    assert_eq!(
+        registry_foreign, baseline_foreign,
+        "{slug}: frozen foreign versions changed between baseline and registry resolution"
+    );
+    save(
+        &proof.evidence.join(format!("{slug}-foreign-packages.json")),
+        &json!({"closure_packages": generated.clone(), "foreign_crates_io": registry_foreign.iter().collect::<Vec<_>>(),
+            "rule": "non-root packages resolve either to the distribution closure or to frozen foreign crates.io versions"}),
+    );
     let expected = graph_contract(&baseline_graph, mappings, false);
     let actual = graph_contract(&registry_graph, mappings, true);
     save(
         &proof
             .evidence
-            .join("supplemental-baseline-logical-graph.json"),
+            .join(format!("{slug}-baseline-logical-graph.json")),
         &expected,
     );
     save(
         &proof
             .evidence
-            .join("supplemental-registry-logical-graph.json"),
+            .join(format!("{slug}-registry-logical-graph.json")),
         &actual,
     );
     record_graph_differences(
         proof,
-        "supplemental-graph-differences",
+        &format!("{slug}-graph-differences"),
         &baseline_graph,
         &registry_graph,
         mappings,
@@ -1190,29 +1328,35 @@ fn supplemental_macro_proof(
     );
     assert_eq!(
         actual, expected,
-        "supplemental macro consumers differ beyond identity mapping"
+        "{slug}: registry normal/build graph changed outside allowed identity rewrites"
     );
-    let keys: BTreeSet<_> = primary
-        .as_object()
-        .unwrap()
-        .keys()
-        .chain(expected.as_object().unwrap().keys())
-        .collect();
-    let activation_changes: Vec<_> = keys.into_iter().filter(|key| primary[*key] != expected[*key])
-        .map(|key| json!({"logical_id": key, "primary": primary[key], "supplemental": expected[key]})).collect();
-    save(
-        &proof.evidence.join("supplemental-feature-allowlist.json"),
-        &json!({
-            "primary_requested_hal_features": ["esp32p4"],
-            "supplemental_requested_hal_features": features,
-            "reason": "separate paired consumer covers proc-macro identity lookup paths hidden behind unstable APIs",
-            "observed_feature_and_resolution_changes": activation_changes,
-            "not_used_to_expand_primary_distribution_closure": true
-        }),
-    );
+    if let Some(primary) = primary_contract {
+        let keys: BTreeSet<_> = primary
+            .as_object()
+            .unwrap()
+            .keys()
+            .chain(expected.as_object().unwrap().keys())
+            .collect();
+        let activation_changes: Vec<_> = keys
+            .into_iter()
+            .filter(|key| primary[*key] != expected[*key])
+            .map(
+                |key| json!({"logical_id": key, "primary": primary[key], "profile": expected[key]}),
+            )
+            .collect();
+        save(
+            &proof
+                .evidence
+                .join(format!("{slug}-feature-allowlist.json")),
+            &json!({"primary_requested_hal_features": PROFILES[0].1,
+                "profile_requested_hal_features": features,
+                "reason": "feature-driven activation and resolution changes relative to the baseline profile; distribution closure is unchanged",
+                "observed_feature_and_resolution_changes": activation_changes}),
+        );
+    }
     let baseline_units = build_units(
         proof,
-        "supplemental-baseline-release-rev103",
+        &format!("{slug}-baseline-release-rev103"),
         &baseline,
         &baseline_home,
         &baseline_graph,
@@ -1222,12 +1366,12 @@ fn supplemental_macro_proof(
     save(
         &proof
             .evidence
-            .join("supplemental-baseline-compiler-units.json"),
+            .join(format!("{slug}-baseline-compiler-units.json")),
         &baseline_units,
     );
     let registry_units = build_units(
         proof,
-        "supplemental-registry-release-rev103",
+        &format!("{slug}-registry-release-rev103"),
         &registry,
         &registry_home,
         &registry_graph,
@@ -1237,57 +1381,65 @@ fn supplemental_macro_proof(
     save(
         &proof
             .evidence
-            .join("supplemental-registry-compiler-units.json"),
+            .join(format!("{slug}-registry-compiler-units.json")),
         &registry_units,
     );
     assert_eq!(
         registry_units, baseline_units,
-        "supplemental compiled host/target feature units differ"
+        "{slug}: host/build/proc-macro/target feature units differ"
     );
-    assert!(!registry_home.join("git").exists());
-    let baseline_elf = baseline
+    assert!(
+        !registry_home.join("git").exists(),
+        "{slug}: registry-only release build fetched Git sources"
+    );
+    let baseline_executable = baseline
         .join("target")
         .join(TARGET)
         .join("release/registry-proof-firmware");
-    let registry_elf = registry
+    let executable = registry
         .join("target")
         .join(TARGET)
         .join("release/registry-proof-firmware");
+    assert!(executable.is_file(), "{slug}: registry release ELF missing");
     fs::copy(
-        &baseline_elf,
-        proof.evidence.join("supplemental-baseline-firmware.elf"),
+        &baseline_executable,
+        proof.evidence.join(format!("{slug}-baseline-firmware.elf")),
     )
     .unwrap();
     fs::copy(
-        &registry_elf,
-        proof.evidence.join("supplemental-registry-firmware.elf"),
+        &executable,
+        proof.evidence.join(format!("{slug}-registry-firmware.elf")),
     )
     .unwrap();
     fs::copy(
-        registry.join("Cargo.toml"),
+        baseline.join("Cargo.lock"),
         proof
             .evidence
-            .join("supplemental-registry-consumer.Cargo.toml"),
+            .join(format!("{slug}-baseline-consumer.Cargo.lock")),
     )
     .unwrap();
     fs::copy(
         registry.join("Cargo.lock"),
         proof
             .evidence
-            .join("supplemental-registry-consumer.Cargo.lock"),
+            .join(format!("{slug}-registry-consumer.Cargo.lock")),
     )
     .unwrap();
-    save(
-        &proof.evidence.join("supplemental-proof.json"),
-        &json!({
-            "target": TARGET, "minimum_chip_revision": 103, "requested_hal_features": features,
-            "normal_build_graph_equal_after_identity_allowlist": true,
-            "compiler_feature_units_equal_after_identity_allowlist": true,
-            "macro_coverage": ["main", "handler", "ram rtc_fast zeroed trait assertion"],
-            "baseline_elf_sha256": hash(&fs::read(baseline_elf).unwrap()),
-            "registry_elf_sha256": hash(&fs::read(registry_elf).unwrap())
-        }),
-    );
+    fs::copy(
+        registry.join("Cargo.toml"),
+        proof
+            .evidence
+            .join(format!("{slug}-registry-consumer.Cargo.toml")),
+    )
+    .unwrap();
+    json!({"slug": slug, "requested_hal_features": features,
+        "macro_coverage": if macros { vec!["main", "handler", "ram rtc_fast zeroed trait assertion"] } else { vec!["main"] },
+        "normal_build_graph_equal_after_identity_allowlist": true,
+        "compiler_feature_units_equal_after_identity_allowlist": true,
+        "foreign_crates_io_packages": registry_foreign.into_iter().collect::<Vec<_>>(),
+        "baseline_elf_sha256": hash(&fs::read(&baseline_executable).unwrap()),
+        "registry_elf_sha256": hash(&fs::read(&executable).unwrap()),
+        "generated_closure_names": generated})
 }
 
 #[test]
@@ -1348,12 +1500,16 @@ fn test_registry_distribution_proof() {
                     .current_dir(work),
             );
             let inventory = work.join("inventory");
-            consumer(
+            // Generator input is the feature-union goal consumer so the SAME
+            // distribution closure covers every matrix profile below.
+            consumer_features(
                 &inventory,
                 &format!(
                     "path = {}",
                     serde_json::to_string(&prepared.join("upstream/esp-hal")).unwrap()
                 ),
+                UNION_FEATURES,
+                false,
             );
             let graph = proof.metadata("inventory", &inventory, &baseline_home, false);
             let metadata = evidence.join("prepared-inventory.json");
@@ -1361,6 +1517,61 @@ fn test_registry_distribution_proof() {
             (prepared, metadata)
         };
     let inventory = load(&inventory_file);
+    // Generator input graph must be the feature-union closure: the HAL node's
+    // activated features cover every matrix profile's request.
+    {
+        let union_root = inventory["resolve"]["root"].as_str().unwrap();
+        let hal_id = array(&inventory["packages"])
+            .iter()
+            .find(|package| {
+                package["name"] == "esp-hal"
+                    && (package["source"].is_null()
+                        || package["source"]
+                            .as_str()
+                            .is_some_and(|source| source.starts_with("git+")))
+            })
+            .and_then(|package| package["id"].as_str())
+            .unwrap();
+        let hal_node = array(&inventory["resolve"]["nodes"])
+            .iter()
+            .find(|node| node["id"].as_str() == Some(hal_id))
+            .unwrap();
+        let activated: BTreeSet<_> = array(&hal_node["features"])
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        if !UNION_FEATURES
+            .iter()
+            .all(|feature| activated.contains(feature))
+        {
+            // Diagnose the request path (goal manifest declaration vs resolved
+            // graph) so a stale frozen input is unmistakable. Strictness kept:
+            // this still fails, but now names the stale source.
+            let requested = array(&inventory["packages"])
+                .iter()
+                .find(|package| package["id"].as_str() == Some(union_root))
+                .and_then(|package| package["dependencies"].as_array())
+                .and_then(|dependencies| {
+                    dependencies.iter().find(|dependency| {
+                        dependency["name"] == "esp-hal" || dependency["rename"] == "esp-hal"
+                    })
+                })
+                .map(|dependency| dependency["features"].clone())
+                .unwrap_or(Value::Null);
+            panic!(
+                "generator input graph must enable the feature union {:?}; HAL node activated {:?}; goal consumer requested esp-hal features {}; {} (evidence: {})",
+                UNION_FEATURES,
+                activated,
+                requested,
+                if frozen_input {
+                    "stale frozen input: ESP_P4_PROOF_PREPARED/METADATA point at an esp32p4-only graph; regenerate them from a union-feature consumer or unset both for a fresh union prepare"
+                } else {
+                    "fresh prepare did not enable the union; fix the inventory consumer manifest/metadata invocation"
+                },
+                evidence.display()
+            );
+        }
+    }
     fs::copy(&inventory_file, evidence.join("input-graph.json")).unwrap();
     let before: BTreeMap<_, _> = array(&inventory["packages"])
         .iter()
@@ -1488,13 +1699,17 @@ fn test_registry_distribution_proof() {
         &verify_sources(&inventory, packages, &distribution),
     );
 
-    let minimal = work.join("baseline-consumer");
-    consumer(
-        &minimal,
+    // The frozen union goal graph must recreate from a fresh prepared
+    // consumer requesting the same feature union.
+    let goal = work.join("goal-recreation-consumer");
+    consumer_features(
+        &goal,
         &format!(
             "path = {}",
             serde_json::to_string(&prepared.join("upstream/esp-hal")).unwrap()
         ),
+        UNION_FEATURES,
+        false,
     );
     let inventory_root = array(&inventory["packages"])
         .iter()
@@ -1508,12 +1723,12 @@ fn test_registry_distribution_proof() {
         inventory_lock.is_file(),
         "frozen goal graph needs its actual Cargo.lock for dependency version parity"
     );
-    fs::copy(&inventory_lock, minimal.join("Cargo.lock")).unwrap();
+    fs::copy(&inventory_lock, goal.join("Cargo.lock")).unwrap();
     fs::copy(&inventory_lock, evidence.join("frozen-goal.Cargo.lock")).unwrap();
-    let baseline_graph = proof.metadata("baseline-minimal-graph", &minimal, &baseline_home, false);
+    let baseline_graph = proof.metadata("goal-recreation-graph", &goal, &baseline_home, false);
     fs::copy(
-        minimal.join("Cargo.lock"),
-        evidence.join("baseline-consumer.Cargo.lock"),
+        goal.join("Cargo.lock"),
+        evidence.join("goal-recreation-consumer.Cargo.lock"),
     )
     .unwrap();
     let frozen_contract = graph_contract(&inventory, packages, false);
@@ -1763,6 +1978,58 @@ fn test_registry_distribution_proof() {
             "target/proc-macro declaration changed for {name}"
         );
         let entry = index_entry(&normalized, &checksum);
+        // Weak-edge semantics must survive the transform: optional PAC edges
+        // stay weak (esp32?/defmt, esp32p4?/rt), never strong (esp32/defmt).
+        if package["original_name"] == "esp-hal" {
+            let weak = entry["features2"].as_object().unwrap();
+            assert_eq!(entry["v"], 2, "HAL index entry must use features2 (v=2)");
+            for (feature, expected) in [("defmt", "esp32?/defmt"), ("rt", "esp32p4?/rt")] {
+                let declared: Vec<_> = weak[feature]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect();
+                assert!(
+                    declared.contains(&expected),
+                    "HAL index entry lost weak edge {expected} in {feature}: {declared:?}"
+                );
+                for edge in &declared {
+                    if let Some((left, _)) = edge.split_once('/') {
+                        let dep = left.trim_end_matches('?');
+                        if matches!(
+                            dep,
+                            "esp32"
+                                | "esp32c2"
+                                | "esp32c3"
+                                | "esp32c5"
+                                | "esp32c6"
+                                | "esp32c61"
+                                | "esp32h2"
+                                | "esp32s2"
+                                | "esp32s3"
+                                | "esp32p4"
+                                | "esp-riscv-rt"
+                                | "xtensa-lx-rt"
+                                | "embedded-io-06"
+                                | "embedded-io-async-06"
+                                | "embedded-io-07"
+                                | "embedded-io-async-07"
+                        ) {
+                            assert!(
+                                left.ends_with('?'),
+                                "weak edge rewritten to activating edge: {edge} in {feature}: {declared:?}"
+                            );
+                        }
+                    }
+                }
+                let activating = expected.replace('?', "");
+                assert!(
+                    !declared.contains(&activating.as_str()),
+                    "activating rewrite {activating} would enable the optional PAC: {declared:?}"
+                );
+            }
+        }
         let index_file = registry.join("index").join(index_path(&name));
         fs::create_dir_all(index_file.parent().unwrap()).unwrap();
         fs::write(
@@ -1783,141 +2050,34 @@ fn test_registry_distribution_proof() {
         .iter()
         .find(|p| p["original_name"] == "esp-hal")
         .unwrap();
-    let registry_consumer = work.join("registry-consumer");
-    consumer(
-        &registry_consumer,
-        &format!(
-            "package = {}, version = {}",
-            serde_json::to_string(&hal["name"]).unwrap(),
-            serde_json::to_string(&format!("={}", text(hal, "version"))).unwrap()
-        ),
-    );
-    seed_registry_lock(
-        &proof,
-        "primary-registry",
-        &minimal.join("Cargo.lock"),
-        &registry_consumer,
-        packages,
-        &archives,
-    );
-    let consumer_home = work.join("consumer-home");
-    home(&consumer_home, Some(&index));
-    assert!(!consumer_home.join("registry").exists() && !consumer_home.join("git").exists());
-    let registry_graph = proof.metadata(
-        "registry-minimal-graph",
-        &registry_consumer,
-        &consumer_home,
-        false,
-    );
-    let consumer_input = manifest(&registry_consumer.join("Cargo.toml"));
-    assert!(consumer_input.get("patch").is_none() && consumer_input.get("replace").is_none());
-    for (_, _, dependencies) in dependency_tables(&consumer_input) {
-        for dependency in dependencies.values() {
-            assert!(dependency.get("path").is_none() && dependency.get("git").is_none());
-        }
-    }
-    for package in array(&registry_graph["packages"]) {
-        if package["id"] == registry_graph["resolve"]["root"] {
-            continue;
-        }
-        assert_eq!(
-            package["source"], "registry+https://github.com/rust-lang/crates.io-index",
-            "registry-only consumer has non-default registry/path/Git source"
+    // Feature-matrix proof: the SAME union-closure distribution feeds every
+    // profile; each profile resolves and release-builds registry-only from
+    // its own isolated consumer pair. The profile count is driven by PROFILES;
+    // nothing below hardcodes it.
+    let mut profiles = Vec::new();
+    let mut primary_contract: Option<Value> = None;
+    for &(slug, features, macros) in PROFILES {
+        let summary = verify_registry_profile(
+            &mut proof,
+            slug,
+            features,
+            macros,
+            &prepared,
+            hal,
+            packages,
+            &archives,
+            work,
+            &index,
+            &inventory_lock,
+            primary_contract.as_ref(),
         );
+        if primary_contract.is_none() {
+            primary_contract = Some(load(
+                &evidence.join(format!("{slug}-baseline-logical-graph.json")),
+            ));
+        }
+        profiles.push(summary);
     }
-    let expected = graph_contract(&baseline_graph, packages, false);
-    let actual = graph_contract(&registry_graph, packages, true);
-    save(&evidence.join("baseline-logical-graph.json"), &expected);
-    save(&evidence.join("registry-logical-graph.json"), &actual);
-    record_graph_differences(
-        &proof,
-        "graph-differences",
-        &baseline_graph,
-        &registry_graph,
-        packages,
-        &expected,
-        &actual,
-        &index,
-    );
-    assert_eq!(
-        actual,
-        expected,
-        "registry normal/build graph changed outside allowed identity rewrites; inspect logical graphs in {}",
-        evidence.display()
-    );
-    assert!(
-        !consumer_home.join("git").exists(),
-        "registry-only consumer fetched Git sources"
-    );
-    let baseline_units = build_units(
-        &mut proof,
-        "baseline-release-rev103",
-        &minimal,
-        &baseline_home,
-        &baseline_graph,
-        packages,
-        false,
-    );
-    save(
-        &evidence.join("baseline-compiler-units.json"),
-        &baseline_units,
-    );
-    let registry_units = build_units(
-        &mut proof,
-        "registry-release-rev103",
-        &registry_consumer,
-        &consumer_home,
-        &registry_graph,
-        packages,
-        true,
-    );
-    save(
-        &evidence.join("compiler-unit-comparison.json"),
-        &json!({
-        "baseline": baseline_units, "registry": registry_units, "unallowlisted_differences": registry_units != baseline_units,
-        "allowed_identity_mapping": "same original_id mapping as graph-differences.json",
-        "host_target_contexts_and_features_must_be_equal": true}),
-    );
-    save(
-        &evidence.join("registry-compiler-units.json"),
-        &registry_units,
-    );
-    assert_eq!(
-        registry_units, baseline_units,
-        "host/build/proc-macro/target feature units differ"
-    );
-    assert!(
-        !consumer_home.join("git").exists(),
-        "registry-only release build fetched Git sources"
-    );
-    let baseline_executable = minimal
-        .join("target")
-        .join(TARGET)
-        .join("release/registry-proof-firmware");
-    fs::copy(
-        &baseline_executable,
-        evidence.join("baseline-proof-firmware.elf"),
-    )
-    .unwrap();
-    let executable = registry_consumer
-        .join("target")
-        .join(TARGET)
-        .join("release/registry-proof-firmware");
-    assert!(executable.is_file());
-    fs::copy(&executable, evidence.join("registry-proof-firmware.elf")).unwrap();
-    fs::copy(
-        registry_consumer.join("Cargo.lock"),
-        evidence.join("registry-consumer.Cargo.lock"),
-    )
-    .unwrap();
-    fs::copy(
-        registry_consumer.join("Cargo.toml"),
-        evidence.join("registry-consumer.Cargo.toml"),
-    )
-    .unwrap();
-    supplemental_macro_proof(
-        &mut proof, &prepared, hal, packages, &archives, work, &index, &expected,
-    );
     let after: BTreeMap<_, _> = before
         .keys()
         .map(|id| {
@@ -1967,20 +2127,21 @@ fn test_registry_distribution_proof() {
                 .to_owned()
         })
         .collect();
-    for package in array(&registry_graph["packages"]) {
-        if packages.iter().any(|mapping| {
-            mapping["name"] == package["name"] && mapping["version"] == package["version"]
-        }) {
+    for summary in &profiles {
+        for name in array(&summary["generated_closure_names"]) {
             assert!(
-                download_names.contains(package["name"].as_str().unwrap()),
-                "fresh consumer did not fetch generated archive from loopback: {}",
-                package["name"]
+                download_names.contains(name.as_str().unwrap()),
+                "fresh {} consumer did not fetch generated archive from loopback: {}",
+                summary["slug"].as_str().unwrap(),
+                name
             );
         }
     }
     save(
         &evidence.join("proof.json"),
-        &json!({"schema": 1, "target": TARGET, "minimum_chip_revision": 103,
+        &json!({"schema": 2, "target": TARGET, "minimum_chip_revision": 103,
+        "generator_input_features": UNION_FEATURES,
+        "generator_input_note": "feature-union goal consumer; closure(union) is the SAME distribution output every profile consumes",
         "distribution_packages": packages.len(), "all_packages_packaged": true,
         "registry_only_release": true, "source_unchanged": true, "archive_payload_comparison": true,
         "normal_build_graph_comparison": true, "compiler_feature_unit_comparison": true, "resolver": "3",
@@ -1989,13 +2150,13 @@ fn test_registry_distribution_proof() {
             "rewrite": "path to default crates.io, all other dependency semantics unchanged",
             "reason": "target-inactive publication normalization, equivalence outside tested P4 target NOT claimed"
         },
-        "elf_sha256": hash(&fs::read(executable).unwrap()),
-        "baseline_elf_sha256": hash(&fs::read(baseline_executable).unwrap()),
+        "weak_edge_assertion": {
+            "index_version": 2, "hal_features_checked": ["defmt", "rt"],
+            "rule": "optional PAC edges stay weak (esp32?/defmt, esp32p4?/rt), never rewritten to activating edges (esp32/defmt)"
+        },
+        "profiles": profiles,
         "crates_io_readiness": "not attempted; generated closure versions must be registered before public resolution",
         "publication_attempted": false, "package_verification": "no-verify; release consumer build is the active-target verification",
-        "primary_requested_hal_features": ["esp32p4"], "primary_consumer_macro_coverage": ["main"],
-        "supplemental_macro_features": ["esp32p4", "critical-section", "unstable"],
-        "supplemental_consumer_macro_coverage": ["main", "handler", "ram rtc_fast zeroed trait assertion"],
         "hardware_exercised": false, "uploaded": false}),
     );
     eprintln!(
