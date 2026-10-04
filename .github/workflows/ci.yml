@@ -24,16 +24,19 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Host Tests
-        run: cargo test
+        run: cargo test --locked
+
+      - name: Release Build
+        run: cargo build --release --locked
 
       - name: Consumer Tests
-        run: cargo test --test consumer -- --ignored --test-threads=1
+        run: cargo test --locked --test consumer -- --ignored --test-threads=1
 
       - name: Package List
-        run: cargo package --list
+        run: cargo package --locked --list
 
       - name: Publish Dry-Run
-        run: cargo publish --dry-run
+        run: cargo publish --dry-run --locked
