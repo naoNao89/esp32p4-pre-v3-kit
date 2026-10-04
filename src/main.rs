@@ -775,6 +775,145 @@ mod tests {
         assert_eq!(fs::read_link(&symlink_dest).unwrap(), Path::new("nowhere"));
     }
 
+    fn get_dir_entries(dir: &Path) -> Vec<OsString> {
+        let mut entries: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn test_occupancy_variants_classified_before_git() {
+        let temp = TempDir::new().unwrap();
+        let manifest_json = make_manifest("repo", "REV", "hash", &["esp-hal"]);
+
+        let dest_dir = temp.path().join("dir");
+        fs::create_dir(&dest_dir).unwrap();
+
+        let dest_file = temp.path().join("file");
+        fs::write(&dest_file, b"sentinel").unwrap();
+
+        let dest_symlink = temp.path().join("symlink");
+        let sentinel_file = temp.path().join("symlink_target");
+        fs::write(&sentinel_file, b"target sentinel").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&sentinel_file, &dest_symlink).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&sentinel_file, &dest_symlink).unwrap();
+
+        let cases = vec![
+            (dest_dir.clone(), "dir"),
+            (dest_file.clone(), "file"),
+            (dest_symlink.clone(), "symlink"),
+        ];
+
+        for (dest, name) in cases {
+            let before_entries = get_dir_entries(temp.path());
+
+            let result = prepare(&dest, &manifest_json, b"");
+            assert!(result.is_err());
+            assert!(
+                result.unwrap_err().contains("destination already exists"),
+                "wrong error for {}",
+                name
+            );
+
+            let after_entries = get_dir_entries(temp.path());
+            assert_eq!(
+                before_entries, after_entries,
+                "parent directory entries changed for {}",
+                name
+            );
+        }
+
+        assert!(dest_dir.is_dir());
+        assert!(fs::read_dir(&dest_dir).unwrap().next().is_none());
+
+        assert_eq!(fs::read(&dest_file).unwrap(), b"sentinel");
+
+        let meta = fs::symlink_metadata(&dest_symlink).unwrap();
+        assert!(meta.is_symlink());
+        assert_eq!(fs::read_link(&dest_symlink).unwrap(), sentinel_file);
+    }
+
+    #[test]
+    fn test_concurrent_prepare_single_winner() {
+        let temp = TempDir::new().unwrap();
+        let (rev, patch_bytes, _) = setup_mock_source(temp.path());
+        let src_url = format!("file://{}", temp.path().join("source").display());
+
+        let mut hasher = Sha256::new();
+        hasher.update(&patch_bytes);
+        let hash = format!("{:x}", hasher.finalize());
+
+        let manifest_json = make_manifest(&src_url, &rev, &hash, &["esp-hal"]);
+        let dest = temp.path().join("dest");
+
+        let dest_clone1 = dest.clone();
+        let manifest_clone1 = manifest_json.clone();
+        let patch_clone1 = patch_bytes.clone();
+
+        let dest_clone2 = dest.clone();
+        let manifest_clone2 = manifest_json.clone();
+        let patch_clone2 = patch_bytes.clone();
+
+        let (res1, res2) = std::thread::scope(|s| {
+            let t1 = s.spawn(move || prepare(&dest_clone1, &manifest_clone1, &patch_clone1));
+            let t2 = s.spawn(move || prepare(&dest_clone2, &manifest_clone2, &patch_clone2));
+            (t1.join().unwrap(), t2.join().unwrap())
+        });
+
+        let mut success_count = 0;
+        let mut err_msg = String::new();
+        if let Err(e) = res1 {
+            err_msg = e;
+        } else {
+            success_count += 1;
+        }
+        if let Err(e) = res2 {
+            err_msg = e;
+        } else {
+            success_count += 1;
+        }
+
+        assert_eq!(success_count, 1, "exactly one prepare should succeed");
+        assert!(
+            err_msg.contains("destination already exists"),
+            "loser should fail with destination already exists, got: {}",
+            err_msg
+        );
+
+        assert!(dest.join("upstream/esp-hal/src/lib.rs").exists());
+        assert!(dest.join("Cargo.patch.toml").exists());
+
+        let upstream = dest.join("upstream");
+        let prep_head = String::from_utf8(
+            Command::new("git")
+                .current_dir(&upstream)
+                .arg("rev-parse")
+                .arg("HEAD")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert_eq!(prep_head, rev, "prepared HEAD does not match pinned rev");
+
+        let prefix = format!(".{}.prepare-", dest.file_name().unwrap().to_string_lossy());
+        for entry in fs::read_dir(temp.path()).unwrap() {
+            let file_name = entry.unwrap().file_name();
+            let name_str = file_name.to_string_lossy();
+            assert!(
+                !name_str.starts_with(&prefix),
+                "leftover staging directory found: {}",
+                name_str
+            );
+        }
+    }
     #[test]
     fn test_parent_absence() {
         let temp = TempDir::new().unwrap();

@@ -137,3 +137,72 @@ fn test_cli_direct_help() {
         help_text
     );
 }
+
+#[test]
+fn test_cli_version_direct_and_injected() {
+    let bin_path = env!("CARGO_BIN_EXE_cargo-esp32p4-pre-v3");
+    let expected_stdout = format!("cargo-esp32p4-pre-v3 {}\n", env!("CARGO_PKG_VERSION"));
+
+    let cases: &[&[&str]] = &[
+        &["--version"],
+        &["-V"],
+        &["esp32p4-pre-v3", "--version"],
+        &["esp32p4-pre-v3", "-V"],
+    ];
+
+    for args in cases {
+        let mut cmd = Command::new(bin_path);
+        cmd.args(*args);
+
+        let output = cmd.output().expect("Failed to execute CLI");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "Expected exit code 0 for args {:?}, got {:?}. stderr: {}",
+            args,
+            output.status.code(),
+            stderr
+        );
+
+        assert_eq!(
+            stdout, expected_stdout,
+            "Expected stdout {:?} for args {:?}, got {:?}",
+            expected_stdout, args, stdout
+        );
+    }
+}
+
+#[test]
+fn test_cli_usage_errors_exit_two() {
+    let bin_path = env!("CARGO_BIN_EXE_cargo-esp32p4-pre-v3");
+
+    let cases: &[&[&str]] = &[&[], &["nonsense"], &["prepare"], &["prepare", "--extra"]];
+
+    for args in cases {
+        let mut cmd = Command::new(bin_path);
+        cmd.args(*args);
+
+        let output = cmd.output().expect("Failed to execute CLI");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "Expected exit code 2 (usage error) for args {:?}, got {:?}. stdout: {}\nstderr: {}",
+            args,
+            output.status.code(),
+            stdout,
+            stderr
+        );
+
+        assert!(
+            !stderr.is_empty(),
+            "Expected non-empty stderr (diagnostic message) for args {:?}",
+            args
+        );
+    }
+}
