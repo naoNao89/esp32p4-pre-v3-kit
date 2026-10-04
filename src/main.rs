@@ -354,8 +354,14 @@ mod tests {
     fn run_git(args: &[&str], dir: &Path) {
         let mut cmd = Command::new("git");
         cmd.current_dir(dir).args(args);
-        let status = cmd.status().expect("git failed to run");
-        assert!(status.success(), "git {:?} failed", args);
+        let output = cmd.output().expect("git failed to run");
+        assert!(
+            output.status.success(),
+            "git {:?} failed\nstdout: {}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn setup_mock_source(root: &Path) -> (String, Vec<u8>, String) {
@@ -440,6 +446,51 @@ mod tests {
         serde_json::to_string(&m).unwrap()
     }
 
+    fn assert_cargo_metadata_resolves_paths(dest: &Path, pkgs: &[(&str, &str)]) {
+        let mut deps = String::new();
+        for (pkg, ver) in pkgs {
+            deps.push_str(&format!("{} = \"={}\"\n", pkg, ver));
+        }
+        let patch_toml = fs::read_to_string(dest.join("Cargo.patch.toml")).unwrap();
+        let consumer_toml = format!(
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n[workspace]\n[dependencies]\n{}\n{}\n",
+            deps, patch_toml
+        );
+
+        fs::write(dest.join("Cargo.toml"), consumer_toml).unwrap();
+        fs::create_dir(dest.join("src")).unwrap();
+        fs::write(dest.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let metadata_out = Command::new("cargo")
+            .current_dir(dest)
+            .args(["metadata", "--offline", "--format-version=1"])
+            .output()
+            .unwrap();
+        assert!(
+            metadata_out.status.success(),
+            "cargo metadata failed with generated Cargo.patch.toml\nstderr: {}",
+            String::from_utf8_lossy(&metadata_out.stderr)
+        );
+
+        let meta_str = String::from_utf8(metadata_out.stdout).unwrap();
+        let meta_json: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
+        let pkgs_array = meta_json["packages"].as_array().unwrap();
+
+        for (pkg, _) in pkgs {
+            let pkg_obj = pkgs_array.iter().find(|p| p["name"] == *pkg).unwrap();
+            let manifest_path = pkg_obj["manifest_path"].as_str().unwrap();
+
+            let expected_path =
+                fs::canonicalize(dest.join("upstream").join(pkg).join("Cargo.toml")).unwrap();
+            let actual_path = fs::canonicalize(Path::new(manifest_path)).unwrap();
+            assert_eq!(
+                actual_path, expected_path,
+                "manifest_path for {} did not resolve to prepared override",
+                pkg
+            );
+        }
+    }
+
     #[test]
     fn test_successful_prepare() {
         let temp = TempDir::new().unwrap();
@@ -503,47 +554,73 @@ mod tests {
             "patched write-tree does not match expected"
         );
 
-        // verify real cargo metadata
-        let mut deps = String::new();
-        for (pkg, ver) in &pkgs {
-            deps.push_str(&format!("{} = \"={}\"\n", pkg, ver));
-        }
-        let patch_toml = fs::read_to_string(dest.join("Cargo.patch.toml")).unwrap();
-        let consumer_toml = format!(
-            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n[workspace]\n[dependencies]\n{}\n{}\n",
-            deps, patch_toml
-        );
+        assert_cargo_metadata_resolves_paths(&dest, &pkgs);
+    }
 
-        fs::write(dest.join("Cargo.toml"), consumer_toml).unwrap();
-        fs::create_dir(dest.join("src")).unwrap();
-        fs::write(dest.join("src/main.rs"), "fn main() {}\n").unwrap();
+    #[test]
+    #[cfg(unix)]
+    fn test_patch_path_escaping() {
+        let temp = TempDir::new().unwrap();
+        let (rev, patch_bytes, _) = setup_mock_source(temp.path());
+        let src_url = format!("file://{}", temp.path().join("source").display());
 
-        let metadata_out = Command::new("cargo")
-            .current_dir(&dest)
-            .args(["metadata", "--offline", "--format-version=1"])
-            .output()
-            .unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&patch_bytes);
+        let hash = format!("{:x}", hasher.finalize());
+
+        let pkgs = [
+            ("esp-hal", "1.1.0"),
+            ("esp-backtrace", "0.19.0"),
+            ("esp-bootloader-esp-idf", "0.5.0"),
+            ("esp-println", "0.17.0"),
+        ];
+        let pkg_names: Vec<&str> = pkgs.iter().map(|(n, _)| *n).collect();
+        let manifest_json = make_manifest(&src_url, &rev, &hash, &pkg_names);
+
+        let dest = temp.path().join("dest space \u{1F980} \" \\ \n \t");
+        let result = prepare(&dest, &manifest_json, &patch_bytes);
         assert!(
-            metadata_out.status.success(),
-            "cargo metadata failed with generated Cargo.patch.toml"
+            result.is_ok(),
+            "prepare failed with escaped dest path: {:?}",
+            result.err()
         );
 
-        let meta_str = String::from_utf8(metadata_out.stdout).unwrap();
-        let meta_json: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
-        let pkgs_array = meta_json["packages"].as_array().unwrap();
+        assert_cargo_metadata_resolves_paths(&dest, &pkgs);
+    }
 
-        for (pkg, _) in &pkgs {
-            let pkg_obj = pkgs_array.iter().find(|p| p["name"] == *pkg).unwrap();
-            let manifest_path = pkg_obj["manifest_path"].as_str().unwrap();
+    #[test]
+    fn test_invalid_package_directory_names() {
+        let temp = TempDir::new().unwrap();
+        let (rev, patch_bytes, _) = setup_mock_source(temp.path());
+        let src_url = format!("file://{}", temp.path().join("source").display());
 
-            let expected_path =
-                fs::canonicalize(dest.join("upstream").join(pkg).join("Cargo.toml")).unwrap();
-            let actual_path = fs::canonicalize(Path::new(manifest_path)).unwrap();
-            assert_eq!(
-                actual_path, expected_path,
-                "manifest_path for {} did not resolve to prepared override",
-                pkg
-            );
+        let mut hasher = Sha256::new();
+        hasher.update(&patch_bytes);
+        let hash = format!("{:x}", hasher.finalize());
+
+        let bad_names = ["", ".", "..", std::path::MAIN_SEPARATOR_STR, "esp-hal/"];
+
+        for (dest_id, bad_name) in bad_names.into_iter().enumerate() {
+            let dest = temp.path().join(format!("dest_{}", dest_id));
+            let manifest_json = make_manifest(&src_url, &rev, &hash, &[bad_name]);
+
+            let mut before_entries: Vec<_> = fs::read_dir(temp.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            before_entries.sort();
+
+            let result = prepare(&dest, &manifest_json, &patch_bytes);
+            assert!(result.is_err());
+            assert!(!dest.exists());
+
+            let mut after_entries: Vec<_> = fs::read_dir(temp.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            after_entries.sort();
+
+            assert_eq!(before_entries, after_entries);
         }
     }
 
@@ -653,14 +730,36 @@ mod tests {
     #[test]
     fn test_existing_directory_and_dangling_symlink() {
         let temp = TempDir::new().unwrap();
+        let (rev, patch_bytes, _) = setup_mock_source(temp.path());
+        let src_url = format!("file://{}", temp.path().join("source").display());
+
+        let mut hasher = Sha256::new();
+        hasher.update(&patch_bytes);
+        let hash = format!("{:x}", hasher.finalize());
+
+        let manifest_json = make_manifest(&src_url, &rev, &hash, &["esp-hal"]);
+
         let dest = temp.path().join("dest");
-
         fs::create_dir(&dest).unwrap();
-        let manifest_json = make_manifest("repo", "rev", "hash", &[]);
+        let sentinel_path = dest.join("sentinel.txt");
+        fs::write(&sentinel_path, "do not overwrite").unwrap();
 
-        let result = prepare(&dest, &manifest_json, b"");
+        let old_patch_toml = dest.join("Cargo.patch.toml");
+        fs::write(&old_patch_toml, "old toml").unwrap();
+
+        let upstream_dir = dest.join("upstream");
+        fs::create_dir(&upstream_dir).unwrap();
+        let keep_bin = upstream_dir.join("keep.bin");
+        fs::write(&keep_bin, b"bin").unwrap();
+
+        let result = prepare(&dest, &manifest_json, &patch_bytes);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("destination already exists"));
+        assert_eq!(
+            fs::read_to_string(&sentinel_path).unwrap(),
+            "do not overwrite"
+        );
+        assert_eq!(fs::read_to_string(&old_patch_toml).unwrap(), "old toml");
+        assert_eq!(fs::read(&keep_bin).unwrap(), b"bin");
 
         let symlink_dest = temp.path().join("symlink");
         #[cfg(unix)]
@@ -668,9 +767,12 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir("nowhere", &symlink_dest).unwrap();
 
-        let result = prepare(&symlink_dest, &manifest_json, b"");
+        let result = prepare(&symlink_dest, &manifest_json, &patch_bytes);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("destination already exists"));
+
+        let meta = fs::symlink_metadata(&symlink_dest).unwrap();
+        assert!(meta.is_symlink());
+        assert_eq!(fs::read_link(&symlink_dest).unwrap(), Path::new("nowhere"));
     }
 
     #[test]

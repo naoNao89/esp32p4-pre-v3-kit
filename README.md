@@ -83,11 +83,13 @@ From the kit root:
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test --locked
 cargo test --test consumer -- --ignored --test-threads=1
 cargo package --list
 cargo publish --dry-run
 ```
+
+The default host suite exercises `prepare` with local Git fixtures and Cargo's offline resolver, asserting Cargo-consumable escaped path overrides, rejection of invalid package directory names, and unchanged existing destinations including `.` and `..`.
 
 Consumer checks are run as an ignored test and require the RISC-V target, network access, and `llvm-objdump` (`rustup component add llvm-tools-preview`). CI runs these same host and consumer checks, as well as a dry-run check of the package structure (`publish --dry-run` performs validation only; no actual publication occurs). If testing packaging with uncommitted changes locally, append `--allow-dirty` to both the `cargo package` and `cargo publish` commands.
 
