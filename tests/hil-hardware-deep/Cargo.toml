@@ -1,0 +1,27 @@
+[workspace]
+members = ["."]
+
+[package]
+name = "hardware-deep"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+esp-hal = { path = "../../target/hil-hardware-deep/upstream/esp-hal", features = ["esp32p4", "critical-section", "unstable"] }
+esp-println = { path = "../../target/hil-hardware-deep/upstream/esp-println", default-features = false, features = ["jtag-serial", "esp32p4"] }
+esp-backtrace = { path = "../../target/hil-hardware-deep/upstream/esp-backtrace", features = ["esp32p4", "panic-handler", "println"] }
+esp-sync = { path = "../../target/hil-hardware-deep/upstream/esp-sync", features = ["esp32p4"] }
+critical-section = "1.2"
+esp-bootloader-esp-idf = { path = "../../target/hil-hardware-deep/upstream/esp-bootloader-esp-idf", features = ["esp32p4"] }
+
+[features]
+default = ["clock-90"]
+clock-90 = []
+clock-180 = []
+clock-360 = []
+
+[profile.release]
+# Local ThinLTO loses F for the HAL's generic naked second-core trampoline.
+# https://github.com/rust-lang/rust/issues/80608
+lto = "off"

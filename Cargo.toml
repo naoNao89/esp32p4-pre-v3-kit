@@ -1,10 +1,37 @@
 [package]
-name = "esp-hal-p4-pre-v3-kit"
+name = "cargo-esp32p4-pre-v3"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-publish = false
+description = "Cargo subcommand to prepare pinned esp-hal sources for pre-v3 ESP32-P4 silicon"
+repository = "https://github.com/naoNao89/esp32p4-pre-v3-kit"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["cargo", "esp32p4", "esp-hal", "embedded", "patch"]
+categories = ["development-tools::cargo-plugins", "embedded"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/src/**",
+    "/tests/*.rs",
+    "/patches/manifest.json",
+    "/patches/esp32p4-pre-v3.patch",
+    "/README.md",
+    "/PROVENANCE.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+]
 
 [[bin]]
-name = "xtask"
-path = "xtask.rs"
+name = "cargo-esp32p4-pre-v3"
+path = "src/main.rs"
+
+[dependencies]
+same-file = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+
+[dev-dependencies]
+regex = "1"

@@ -4,26 +4,33 @@ This kit contains a source patch and a preparation tool for pre-v3 ESP32-P4 supp
 
 ## Prepare the source
 
-Prerequisites: Rust 1.95 or newer, Python 3.9 or newer, and Git.
+Prerequisites: Rust 1.95 or newer, and Git.
 
-For example, keep the kit, application, and generated source in sibling directories:
+For example, keep your application and the generated source in sibling directories:
 
 ```text
 work/
-├── esp32p4-pre-v3-kit/
 ├── app/
 └── prepared/                 # created by the command
 ```
 
-From the kit root, run:
+Install the CLI tool:
 
 ```sh
-cargo xtask prepare ../prepared
+cargo install cargo-esp32p4-pre-v3
 ```
 
-The tool fetches the exact upstream `esp-hal` base revision `e02f3613e9f9ba1ce00070eb387e3bf4fde2267b`, applies the bundled patch, and places the checkout at `../prepared/upstream`. It also writes `../prepared/Cargo.patch.toml` with the Cargo path overrides. Relative destinations resolve from your current directory. The destination's parent directory must exist, and the destination itself must not already exist. The tool does not overwrite existing directories or use a shared source cache.
+Then from the `work` directory (alongside `app`), run the prepare command:
 
-Merge the `[patch.crates-io]` entries from `../prepared/Cargo.patch.toml` into the application's workspace-root `Cargo.toml` (merge with an existing table if needed). The generated entries use absolute paths. For the sibling-directory layout above, the equivalent relative paths are:
+```sh
+cargo esp32p4-pre-v3 prepare ./prepared
+```
+
+For local development within the kit repository, use `cargo run -- prepare ../prepared`.
+
+The tool fetches the exact upstream `esp-hal` base revision `e02f3613e9f9ba1ce00070eb387e3bf4fde2267b` via Git, applies the embedded patch, and places the checkout at `./prepared/upstream`. It also writes `./prepared/Cargo.patch.toml` with the Cargo path overrides. Relative destinations resolve from your current directory. The destination's parent directory must exist, and the destination itself must not already exist. The tool does not overwrite existing directories or use a shared source cache. The patch and base manifest are embedded directly in the single Rust binary; an original kit checkout or Python setup is not required after installation.
+
+Merge the `[patch.crates-io]` entries from `./prepared/Cargo.patch.toml` into the application's workspace-root `Cargo.toml` (merge with an existing table if needed). The generated entries use absolute paths. For the sibling-directory layout above, the equivalent relative paths are:
 
 ```toml
 [patch.crates-io]
@@ -74,16 +81,17 @@ If unset, the revision strictly defaults to `300` (v3+), which will not run on p
 From the kit root:
 
 ```sh
-cargo xtask host-tests
-cargo xtask fmt-packages -- --check
-cargo xtask lint-packages
-python3 tests/check_consumer.py --revision 103 --destination target/consumer-103
-python3 tests/check_consumer.py --revision 300 --destination target/consumer-300
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --locked
+cargo test --test consumer -- --ignored --test-threads=1
+cargo package --list
+cargo publish --dry-run
 ```
 
-Consumer checks require the RISC-V target, network access, and `llvm-objdump` (`rustup component add llvm-tools-preview`, or Xcode's `xcrun llvm-objdump`). Each destination must be new; the checks refuse to overwrite an existing path. CI runs these same host and consumer checks.
+The default host suite exercises `prepare` with local Git fixtures and Cargo's offline resolver, asserting Cargo-consumable escaped path overrides, rejection of invalid package directory names, and unchanged existing destinations including `.` and `..`.
 
-`xtask` uses the executable specified by `PYTHON`, or discovers `python3`, `python`, then the Windows `py -3` launcher. Set `PYTHON` to a Python 3.9+ executable if the default interpreter is unsuitable.
+Consumer checks are run as an ignored test and require the RISC-V target, network access, and `llvm-objdump` (`rustup component add llvm-tools-preview`). CI runs these same host and consumer checks, as well as a dry-run check of the package structure (`publish --dry-run` performs validation only; no actual publication occurs). If testing packaging with uncommitted changes locally, append `--allow-dirty` to both the `cargo package` and `cargo publish` commands.
 
 ## Scope and limits
 
@@ -91,7 +99,7 @@ The patch covers pre-v3 CLIC interrupts, revision-dependent clocks, UART0–UART
 
 The preparation command was exercised against the official upstream repository. A minimal HAL consumer was build/link checked for revisions `103` and `300`; disassembly of its retained `esp-sync` lock routine showed CSR `0x347` absent for `103` and present for `300`.
 
-### ESP32-P4 v1.3 limited hardware smoke test: PASS
+### Historical ESP32-P4 v1.3 limited hardware smoke test: PASS
 
 Tested on one ESP32-P4 silicon revision v1.3 board (40 MHz crystal, 32 MB flash) with a rev103 build on 2026-10-03:
 
@@ -111,15 +119,50 @@ HIL_PASS
 
 Output used USB Serial/JTAG, not peripheral UART. The capture contains a USB-UART reset before the successful run; PASS applies to the complete run after that reset.
 
-This is a bounded single-core smoke test, not general peripheral certification or full ESP32-P4 v1.3 support. Peripheral UART TX/RX, baud-rate changes, RcFast/delay calibration, dual-core stress, PSRAM, ROM-table coverage, and other peripherals remain unvalidated.
+### ESP32-P4 v1.3 deep hardware validation: PASS
+
+On the same v1.3 board, five complete runs passed on 2026-10-03: CPU profiles 90 MHz (one run), 180 MHz (one run), and 360 MHz (three runs, including two reset-only repeats). Whole-ELF disassembly found no CSR `0x347` instructions in any of the three clock-profile images.
+
+For the preserved source fixture and manual reproduction commands, see [tests/hil-hardware-deep](tests/hil-hardware-deep/README.md).
+
+With Rust 1.98.1, local ThinLTO compilation of the second-core `fscsr` trampoline failed; the diagnostic release profile used `lto = "off"`. The SDK and compatibility patch were not modified.
+
+Raw evidence remains outside this repository in the local `ESP32P4-backups` directory. The result manifest is `80f1b2d06a6f-deep-20261003-235336-results.json`; matching logs and source/image archives use the same filename prefix.
+
+Summary per run:
+- **UART loopback:** 360 internal UART0–4 loopback vectors across three clock sources (XTAL, PLL_F80M, RC_FAST), baud rates 9,600/115,200/1,000,000/2,000,000, and payload lengths 1/127/128/129/513/1,024 bytes. Separately, 120 timing vectors, 25 invalid-configuration checks, 25 recovery vectors, and six UART1 interrupt checks completed.
+- **Dual-core interrupts and locks:** 1,000,000 raw-lock pairs on core0 and 100,000 on core1, plus nested raw-lock and critical-section checks. Fixed cross-core critical sections completed 500,000 entries per core; the weighted counter was exactly 1,500,000. A further 10-second dual-core/dual-IRQ soak checked independent iteration counts and the exact shared counter.
+- **ROM and SRAM:** Selected ROM CRC32, MD5, and memory operations (`memset`, `memcpy`, overlapping `memmove` in both directions, and `memcmp`); 100/1,000/10,000 µs ROM delay measurements against XTAL-derived time; and 32 KiB internal SRAM checked with 65 patterns.
+- **Outcomes:** All accepted runs booted exactly once and reached `HIL_PASS_DEEP`, with full UART coverage and exact lock counters. No observed device failures, panics, or traps. Incomplete non-interactive monitor captures were cleanly excluded (validated runs passed, not every single capture attempt).
+- **RC_FAST:** Measured ~0.85 nominal XTAL-relative ratio; no external baud certification.
+
+Short excerpt from the actual 360 MHz reset3 run:
+
+```text
+HIL_UART_SUMMARY matrix_vectors=360 timing_vectors=120 negative_configs=25 recovery_vectors=25 irq_checks=6
+HIL_PROGRESS: UART completed_vectors=360
+HIL_STAGE: core0 raw=1000000 remote_inside_mask_probes=1000
+HIL_PROGRESS: core0_raw=1000000 core1_raw=100000 masked_remote_probes=1000 nested_raw_both=true
+HIL_STAGE: crosscore fixed CS updates_per_core=500000 increments=2,1
+HIL_PROGRESS: fixed_cs core0=500000 core1=500000 protected=1500000 expected=1500000 nested_cs_both=true
+HIL_STAGE: dualcore dualIRQ CS soak duration_us=10000000
+HIL_PROGRESS: soak elapsed_us=10000004 core0_iterations=3875385 core1_iterations=3882572 protected=11633342 expected=11633342 t0_delta=8992 t1_delta=7565
+HIL_STAGE: AppCpu DONE handoff outside locks then guard drop
+HIL_PROGRESS: AppCpu_stalled=true ProCpu_running=true T1_stopped=true
+HIL_PROGRESS: all phases complete rom_checks=532504 uart_vectors=360 fixed_counter_value=1500000 soak_duration_s=10
+HIL_PASS_DEEP
+```
+
+This is a bounded validation block. External GPIO/UART routing and signals, absolute external baud calibration, PSRAM, LP_UART, unselected ROM APIs (including f64 ABI), other peripherals, power-cycle or reset-during-workload behaviors, and long-duration thermal certifications remain explicitly unvalidated.
 
 **Hardware validation checklist:**
 - [x] boot on one v1.3 board
 - [x] timer interrupt smoke
 - [x] single-core interrupt-lock/critical-section loop smoke
-- [ ] UART TX/RX
-- [ ] baud change
-- [ ] delay calibration
-- [ ] dualcore interrupt stress
+- [x] internal UART TX/RX loopback and baud changes
+- [x] dual-core interrupt stress
+- [x] scoped selected ROM delay verified
+- [ ] unverified external UART routing/baud absolute calibration
+- [ ] absolute full delay calibration
 
 Based on [esp-rs/esp-hal](https://github.com/esp-rs/esp-hal). Pre-v3 CLIC and CPLL changes are credited to [hatomist](https://github.com/hatomist/esp-hal); the UART and ROM-table changes are in this kit's patch. See the [upstream UART example at the pinned base revision](https://github.com/esp-rs/esp-hal/blob/e02f3613e9f9ba1ce00070eb387e3bf4fde2267b/examples/interrupt/uart/src/main.rs). The source is provided under the included [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) license. For ROM table derivations, see [PROVENANCE.md](PROVENANCE.md).
