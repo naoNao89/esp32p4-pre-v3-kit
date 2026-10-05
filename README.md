@@ -48,6 +48,8 @@ cargo esp32p4-pre-v3 prepare ./prepared
 
 For local development within the kit repository, use `cargo run -- prepare ../prepared`.
 
+The tool fetches the exact upstream `esp-hal` base revision `e02f3613e9f9ba1ce00070eb387e3bf4fde2267b` via Git, applies the embedded patch, and places the checkout at `./prepared/upstream`. It also writes `./prepared/Cargo.patch.toml` with the Cargo path overrides. Relative destinations resolve from your current directory. The destination's parent directory must exist, and the destination itself must not already exist. The tool does not overwrite existing directories or use a shared source cache. The patch and base manifest are embedded directly in the single Rust binary; an original kit checkout or Python setup is not required after installation.
+
 The second subcommand regenerates the isolated registry package inputs
 from a validated prepared graph:
 
