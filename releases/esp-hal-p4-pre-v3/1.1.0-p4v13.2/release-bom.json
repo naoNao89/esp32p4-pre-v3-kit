@@ -1,0 +1,15 @@
+{
+  "release": "1.1.0-p4v13.2",
+  "kind": "HAL-only cosmetic re-release; all 11 dependency crates unchanged at 1.1.0-p4v13.1-era versions",
+  "base_distribution": "releases/esp-hal-p4-pre-v3/1.1.0-p4v13.1 (same HAL source tree; only Cargo.toml version/description and README.md differ)",
+  "package": "esp-hal-p4-pre-v3",
+  "version": "1.1.0-p4v13.2",
+  "crate_sha256": "aa8582f162177f3d8e17fabaad35bffd82ecec2977ac06583e419f7f50e8783b",
+  "crate_bytes": 786994,
+  "transform_commits": [
+    "8e22ed7",
+    "0af624a"
+  ],
+  "verification": "cargo package + publish --dry-run PASS; rev103 path-consumer release build PASS; published to crates.io and confirmed via cargo info",
+  "host_verify_note": "published with --no-verify (chip-gated build script cannot pass host verification; real-target matrix proof in 1.1.0-p4v13.1 evidence)"
+}
