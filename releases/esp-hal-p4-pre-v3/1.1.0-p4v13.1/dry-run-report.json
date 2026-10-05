@@ -1,0 +1,19 @@
+{
+  "dry_run_tree": "target/distribution-validation/release/distribution",
+  "command": "cargo publish --dry-run --locked --manifest-path <crate>/Cargo.toml",
+  "results": {
+    "esp-hal-procmacros-p4-pre-v3": "PASS (verified)",
+    "esp-metadata-generated-p4-pre-v3": "PASS (verified)",
+    "esp32-p4-pre-v3": "PASS (verified)",
+    "esp32p4-p4-pre-v3-5a07030": "PASS (verified)",
+    "esp32p4-p4-pre-v3-fc3e6d4": "PASS (verified)",
+    "esp32s2-p4-pre-v3": "PASS (verified)",
+    "esp32s3-p4-pre-v3": "PASS (verified)",
+    "esp-riscv-rt-p4-pre-v3": "PACKAGING PASS via --no-verify; host verify fails on macOS (link_section ELF-only, same for upstream; publish from Linux or --no-verify)",
+    "esp-sync-p4-pre-v3": "BLOCKED pre-publish: needs esp-metadata-generated-p4-pre-v3 on index (ordering, not defect)",
+    "esp-config-p4-pre-v3": "BLOCKED pre-publish: needs esp-metadata-generated-p4-pre-v3 on index",
+    "esp-rom-sys-p4-pre-v3": "BLOCKED pre-publish: needs esp-config/esp-metadata-generated/esp32p4-fc3e6d4 on index",
+    "esp-hal-p4-pre-v3": "BLOCKED pre-publish: needs 6 internal deps on index"
+  },
+  "real_upload": "NOT attempted (needs cargo login + owner decision)"
+}

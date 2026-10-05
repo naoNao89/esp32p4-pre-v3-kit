@@ -1,0 +1,12 @@
+1. esp-hal-procmacros-p4-pre-v3 =0.22.0-p4v13.1  <- no internal deps
+2. esp-metadata-generated-p4-pre-v3 =0.4.0-p4v13.1  <- no internal deps
+3. esp-riscv-rt-p4-pre-v3 =0.14.0-p4v13.1  <- no internal deps
+4. esp-sync-p4-pre-v3 =0.2.1-p4v13.1  <- esp-metadata-generated-p4-pre-v3
+5. esp32-p4-pre-v3 =0.40.2-p4v13.1  <- no internal deps
+6. esp32p4-p4-pre-v3-5a07030 =0.2.0-p4v13.1  <- no internal deps
+7. esp32p4-p4-pre-v3-fc3e6d4 =0.2.0-p4v13.1  <- no internal deps
+8. esp32s2-p4-pre-v3 =0.31.2-p4v13.1  <- no internal deps
+9. esp32s3-p4-pre-v3 =0.35.2-p4v13.1  <- no internal deps
+10. esp-config-p4-pre-v3 =0.7.0-p4v13.1  <- esp-metadata-generated-p4-pre-v3
+11. esp-rom-sys-p4-pre-v3 =0.1.4-p4v13.1  <- esp-config-p4-pre-v3, esp-metadata-generated-p4-pre-v3
+12. esp-hal-p4-pre-v3 =1.1.0-p4v13.1  <- esp-config-p4-pre-v3, esp-hal-procmacros-p4-pre-v3, esp-metadata-generated-p4-pre-v3, esp-riscv-rt-p4-pre-v3, esp-rom-sys-p4-pre-v3, esp-sync-p4-pre-v3

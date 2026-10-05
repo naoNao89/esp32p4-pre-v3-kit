@@ -165,4 +165,42 @@ This is a bounded validation block. External GPIO/UART routing and signals, abso
 - [ ] unverified external UART routing/baud absolute calibration
 - [ ] absolute full delay calibration
 
+
+## Published registry package: `esp-hal-p4-pre-v3`
+
+The pinned pre-v3 HAL is also distributed as a renamed Cargo package,
+verified end-to-end from crates.io with a clean consumer:
+
+```toml
+[dependencies]
+esp-hal = {
+    package = "esp-hal-p4-pre-v3",
+    version = "=1.1.0-p4v13.1",
+    features = ["esp32p4"]
+}
+```
+
+Source keeps using `use esp_hal::...`; only the dependency declaration
+points at the renamed package. Supported feature profiles are `esp32p4`
+(baseline), `critical-section` + `unstable`, `log-04`, `defmt`, and their
+maximal valid combination (`log-04` and `defmt` are mutually exclusive per
+HAL `build.rs`). The 12-crate distribution closure, per-profile
+graph/payload parity evidence, and the publish bill of materials live in
+`releases/esp-hal-p4-pre-v3/1.1.0-p4v13.1/`.
+
+Reproducible smoke test from crates.io (fresh homes, no checkout leakage):
+
+```sh
+export CARGO_HOME="$(mktemp -d)" CARGO_TARGET_DIR="$(mktemp -d)"
+ESP_HAL_CONFIG_MIN_CHIP_REVISION=103 cargo rustc --release \
+  --target riscv32imafc-unknown-none-elf \
+  --manifest-path /path/to/app/Cargo.toml -- \
+  -C link-arg=-Tlinkall.x -C force-frame-pointers=yes
+```
+
+Do not force `linker = "rust-lld"` in the consumer Cargo config.
+Use the target/linker arguments documented here; an explicit linker
+override changes what `rustc` passes to the link stage and can break
+linking of the runtime startup objects.
+
 Based on [esp-rs/esp-hal](https://github.com/esp-rs/esp-hal). Pre-v3 CLIC and CPLL changes are credited to [hatomist](https://github.com/hatomist/esp-hal); the UART and ROM-table changes are in this kit's patch. See the [upstream UART example at the pinned base revision](https://github.com/esp-rs/esp-hal/blob/e02f3613e9f9ba1ce00070eb387e3bf4fde2267b/examples/interrupt/uart/src/main.rs). The source is provided under the included [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) license. For ROM table derivations, see [PROVENANCE.md](PROVENANCE.md).

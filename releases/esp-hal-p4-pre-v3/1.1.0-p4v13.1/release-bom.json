@@ -1,0 +1,121 @@
+{
+  "release": "p4v13.1",
+  "prepared_commit": "e02f3613e9f9ba1ce00070eb387e3bf4fde2267b",
+  "transform_commits": [
+    "8e22ed7",
+    "0af624a"
+  ],
+  "target": "riscv32imafc-unknown-none-elf",
+  "crates": [
+    {
+      "name": "esp-hal-procmacros-p4-pre-v3",
+      "version": "0.22.0-p4v13.1",
+      "directory": "crates/esp-hal-procmacros-p4-pre-v3",
+      "source_tree_hash": "62665e4d9ce698dc8ebcc0d490459da0a2ef85c369f2ca0f6aa8b9d358662b5e",
+      "generated_tree_hash": "529786758c7a329d9d55524a3048a1c3cd0c98521a8f9c6ec4ec7ab0b4527d60",
+      "depends_on": []
+    },
+    {
+      "name": "esp-metadata-generated-p4-pre-v3",
+      "version": "0.4.0-p4v13.1",
+      "directory": "crates/esp-metadata-generated-p4-pre-v3",
+      "source_tree_hash": "1089d806cfc5299104a02abfad4e1dd9b35ff49a34b63092551401450080935a",
+      "generated_tree_hash": "f3da056cf049040236f70ae1b9448c4606cd5fca1110483442497758c56246ed",
+      "depends_on": []
+    },
+    {
+      "name": "esp-riscv-rt-p4-pre-v3",
+      "version": "0.14.0-p4v13.1",
+      "directory": "crates/esp-riscv-rt-p4-pre-v3",
+      "source_tree_hash": "9f3119968b18d500c2c659215e4e0a534279dcef1cb2501103e2e031f68ba38c",
+      "generated_tree_hash": "8ed2e7b14e0a6211c1ce7434d3381cf391c23fc0885d46d7c8b38f39bd8fef97",
+      "depends_on": []
+    },
+    {
+      "name": "esp-sync-p4-pre-v3",
+      "version": "0.2.1-p4v13.1",
+      "directory": "crates/esp-sync-p4-pre-v3",
+      "source_tree_hash": "6b9680f77afdb1ddf6f307f22824c73303cdda7991b481afa9196572cc757310",
+      "generated_tree_hash": "50f3bc80192230c893840a6327d9c3be1ada3c3bf0b73d94e4a992f9433a6a57",
+      "depends_on": [
+        "esp-metadata-generated-p4-pre-v3"
+      ]
+    },
+    {
+      "name": "esp32-p4-pre-v3",
+      "version": "0.40.2-p4v13.1",
+      "directory": "crates/esp32-p4-pre-v3",
+      "source_tree_hash": "09f25fa149d0d70620d16a24d9f9040e4b84bed40fe5b2c4bd11203de4fa29dd",
+      "generated_tree_hash": "e34a1751b89055848674cc061b3c83dede6a4eed7189b880e2a49411433cee53",
+      "depends_on": []
+    },
+    {
+      "name": "esp32p4-p4-pre-v3-5a07030",
+      "version": "0.2.0-p4v13.1",
+      "directory": "crates/esp32p4-p4-pre-v3-5a07030",
+      "source_tree_hash": "68761f4eb8a1e32afd46e3c9d9d73f59924d4f568a9c97781cec7017be2f3cb6",
+      "generated_tree_hash": "847aaad9eab62d0e99dc91831d86c3944a0f9dfc1fbfe9db22528145f175d26d",
+      "depends_on": []
+    },
+    {
+      "name": "esp32p4-p4-pre-v3-fc3e6d4",
+      "version": "0.2.0-p4v13.1",
+      "directory": "crates/esp32p4-p4-pre-v3-fc3e6d4",
+      "source_tree_hash": "30991ec7d8bb2ec80804926c604805dceca810ca936c2622db042a1158693757",
+      "generated_tree_hash": "d7061904c0fc98fe3158e5a0b55c6b4fe927a2240e15553841da76157c55db9a",
+      "depends_on": []
+    },
+    {
+      "name": "esp32s2-p4-pre-v3",
+      "version": "0.31.2-p4v13.1",
+      "directory": "crates/esp32s2-p4-pre-v3",
+      "source_tree_hash": "a5f76f254050a1d17d244b84b0f1ea479d90fde6226c9b6c4ccd863d6e263c23",
+      "generated_tree_hash": "5d36c09bcfc39adb0866791ed33d3201141e06206599c226de61033bdf729ee3",
+      "depends_on": []
+    },
+    {
+      "name": "esp32s3-p4-pre-v3",
+      "version": "0.35.2-p4v13.1",
+      "directory": "crates/esp32s3-p4-pre-v3",
+      "source_tree_hash": "6715fddd7d2debd238d6cacc603765ae2fd8dd5ac2cec548e711db7e92dbccaa",
+      "generated_tree_hash": "6db92b0f50dbaa06c3bdcbd30b77a725ff8164c52c7dd573a8578f785b632e22",
+      "depends_on": []
+    },
+    {
+      "name": "esp-config-p4-pre-v3",
+      "version": "0.7.0-p4v13.1",
+      "directory": "crates/esp-config-p4-pre-v3",
+      "source_tree_hash": "e919f4d1a91c9990a00c03cf012dd36b23e6dc23a621f9268852c16d4805449f",
+      "generated_tree_hash": "3d325094512fdc36355b40f69978e5bfb8a2ff00d222031e38f01a243d59ae81",
+      "depends_on": [
+        "esp-metadata-generated-p4-pre-v3"
+      ]
+    },
+    {
+      "name": "esp-rom-sys-p4-pre-v3",
+      "version": "0.1.4-p4v13.1",
+      "directory": "crates/esp-rom-sys-p4-pre-v3",
+      "source_tree_hash": "59bcc4645a57c47448829a26e86bec0ff7e9e328fb4ac8af4ac692a2473b3051",
+      "generated_tree_hash": "7f2f5697967b095e1c387681749229b42331572705e93ca0c2465d4f6ade13ff",
+      "depends_on": [
+        "esp-config-p4-pre-v3",
+        "esp-metadata-generated-p4-pre-v3"
+      ]
+    },
+    {
+      "name": "esp-hal-p4-pre-v3",
+      "version": "1.1.0-p4v13.1",
+      "directory": "crates/esp-hal-p4-pre-v3",
+      "source_tree_hash": "65b65aa653fa6262d5cc89e41946ac8f37f1b9524d79f483018741508715c873",
+      "generated_tree_hash": "e1443a0e200cefafd538ecf4bba0eb282088e511ccfd476d8deac5cdc1083744",
+      "depends_on": [
+        "esp-config-p4-pre-v3",
+        "esp-hal-procmacros-p4-pre-v3",
+        "esp-metadata-generated-p4-pre-v3",
+        "esp-riscv-rt-p4-pre-v3",
+        "esp-rom-sys-p4-pre-v3",
+        "esp-sync-p4-pre-v3"
+      ]
+    }
+  ]
+}
