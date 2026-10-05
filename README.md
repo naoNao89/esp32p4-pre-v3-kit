@@ -1,8 +1,28 @@
 # ESP32-P4 pre-v3 source patch kit
 
-This kit contains a source patch and a preparation tool for pre-v3 ESP32-P4 support. It is not a replacement HAL crate or a runtime add-on: applications continue to use the normal `esp-hal` crates and API.
+This kit contains a source patch and a preparation tool for pre-v3 ESP32-P4 support. The tested output is also published as normal Cargo packages (see below), so most users never need to run the preparation tool: applications keep using the normal `esp-hal` crates and API.
 
-## Prepare the source
+## Quick start
+
+Check your chip revision with Espressif's own tool:
+
+```sh
+espflash board-info
+```
+
+- Revision 3.0 or newer: use upstream `esp-hal`. Nothing here is for you.
+- Revision below 3.0: depend on the compatibility package:
+
+```toml
+[dependencies]
+esp-hal = { package = "esp-hal-p4-pre-v3", version = "=1.1.0-p4v13.2", features = ["esp32p4"] }
+```
+
+Then build exactly as below (revision variable, target, linker flags).
+The rest of this document describes the source-preparation path, which you
+only need if you want to rebuild or audit the pinned patched source itself.
+
+## Prepare the source (advanced)
 
 Prerequisites: Rust 1.95 or newer, and Git.
 
@@ -28,7 +48,19 @@ cargo esp32p4-pre-v3 prepare ./prepared
 
 For local development within the kit repository, use `cargo run -- prepare ../prepared`.
 
-The tool fetches the exact upstream `esp-hal` base revision `e02f3613e9f9ba1ce00070eb387e3bf4fde2267b` via Git, applies the embedded patch, and places the checkout at `./prepared/upstream`. It also writes `./prepared/Cargo.patch.toml` with the Cargo path overrides. Relative destinations resolve from your current directory. The destination's parent directory must exist, and the destination itself must not already exist. The tool does not overwrite existing directories or use a shared source cache. The patch and base manifest are embedded directly in the single Rust binary; an original kit checkout or Python setup is not required after installation.
+The second subcommand regenerates the isolated registry package inputs
+from a validated prepared graph:
+
+```sh
+cargo esp32p4-pre-v3 distribute PREPARED METADATA_JSON DEST
+```
+
+`distribute` is the maintainer path used to cut releases, not something
+application developers need.
+
+Neither command inspects the connected chip. Selecting the wrong minimum
+revision below builds firmware for the wrong silicon family with no
+warning beyond the revision variable itself.
 
 Merge the `[patch.crates-io]` entries from `./prepared/Cargo.patch.toml` into the application's workspace-root `Cargo.toml` (merge with an existing table if needed). The generated entries use absolute paths. For the sibling-directory layout above, the equivalent relative paths are:
 
@@ -165,29 +197,10 @@ This is a bounded validation block. External GPIO/UART routing and signals, abso
 - [ ] unverified external UART routing/baud absolute calibration
 - [ ] absolute full delay calibration
 
-## Do you actually need `esp-hal-p4-pre-v3`?
+## Published packages
 
-Probably not. This is a compatibility build of
-[esp-hal](https://github.com/esp-rs/esp-hal) for pre-v3 ESP32-P4 silicon
-(chip revision below 3.0). Check yours with Espressif's own tool:
-
-```sh
-espflash board-info
-```
-
-```text
-ESP32-P4
-   │
-   ├── revision >= 3.0 → use upstream esp-hal, you don't need this crate
-   │
-   └── revision < 3.0 → use esp-hal-p4-pre-v3:
-
-esp-hal = { package = "esp-hal-p4-pre-v3", version = "=1.1.0-p4v13.2", features = ["esp32p4"] }
-```
-
-Rust code stays the same (`use esp_hal::...`). Validated on v1.3 silicon
-for the tested paths (boot, interrupts, locks, UART, ROM, dual-core);
-not every peripheral combination is validated.
+Which package to use is decided in [Quick start](#quick-start): revision
+3.0+ uses upstream `esp-hal`, pre-v3 uses `esp-hal-p4-pre-v3`.
 
 ### Technical details
 
@@ -195,8 +208,8 @@ Supported feature profiles are `esp32p4` (baseline), `critical-section` +
 `unstable`, `log-04`, `defmt`, and their maximal valid combination
 (`log-04` and `defmt` are mutually exclusive per HAL `build.rs`). The
 12-crate distribution closure, per-profile graph/payload parity evidence,
-and the publish bill of materials live in
-`releases/esp-hal-p4-pre-v3/1.1.0-p4v13.1/`.
+and publish bills of materials live in `releases/esp-hal-p4-pre-v3/`
+(one directory per published version).
 
 Reproducible smoke test from crates.io (fresh homes, no checkout leakage):
 
