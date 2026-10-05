@@ -165,11 +165,37 @@ This is a bounded validation block. External GPIO/UART routing and signals, abso
 - [ ] unverified external UART routing/baud absolute calibration
 - [ ] absolute full delay calibration
 
+## Do you actually need `esp-hal-p4-pre-v3`?
 
-## Published registry package: `esp-hal-p4-pre-v3`
+You probably do not.
 
-The pinned pre-v3 HAL is also distributed as a renamed Cargo package,
-verified end-to-end from crates.io with a clean consumer:
+This is a compatibility build of `esp-hal` for early ESP32-P4 silicon with
+chip revision **below 3.0**, including the v1.3 development kits that escaped
+into the world before the production silicon arrived.
+
+First, check what chip you actually have with Espressif's own tool:
+
+```sh
+espflash board-info
+```
+
+Look for the ESP32-P4 chip revision.
+
+### Revision 3.0 or newer?
+
+Congratulations. Your chip is normal. Use upstream `esp-hal`:
+
+```toml
+[dependencies]
+esp-hal = { version = "...", features = ["esp32p4"] }
+```
+
+You do not need this compatibility package.
+
+### Revision below 3.0?
+
+My condolences. You own preliminary ESP32-P4 silicon.
+Fortunately, that is exactly what this package is for:
 
 ```toml
 [dependencies]
@@ -180,12 +206,44 @@ esp-hal = {
 }
 ```
 
-Source keeps using `use esp_hal::...`; only the dependency declaration
-points at the renamed package. Supported feature profiles are `esp32p4`
-(baseline), `critical-section` + `unstable`, `log-04`, `defmt`, and their
-maximal valid combination (`log-04` and `defmt` are mutually exclusive per
-HAL `build.rs`). The 12-crate distribution closure, per-profile
-graph/payload parity evidence, and the publish bill of materials live in
+Your Rust code remains unchanged:
+
+```rust
+use esp_hal::{Config, clock::CpuClock};
+```
+
+```text
+ESP32-P4
+   │
+   ├── revision >= 3.0
+   │      └── use upstream esp-hal
+   │
+   └── revision < 3.0
+          └── use esp-hal-p4-pre-v3
+```
+
+That is the entire decision tree.
+
+### Why does this exist?
+
+ESP32-P4 silicon before revision 3.0 differs from production revisions in
+several low-level areas. Code intended for production P4 silicon cannot
+simply be assumed to work on these earlier chips.
+
+This distribution preserves the compatible `esp-hal` source graph required
+by the tested pre-v3 configuration and publishes it as normal Cargo
+packages. It has been validated on an ESP32-P4 v1.3 board for the tested
+paths, including boot, interrupts, synchronization, UART, ROM calls, and
+dual-core execution. It is not a claim that every peripheral combination
+on preliminary silicon has been validated.
+
+### Technical details
+
+Supported feature profiles are `esp32p4` (baseline), `critical-section` +
+`unstable`, `log-04`, `defmt`, and their maximal valid combination
+(`log-04` and `defmt` are mutually exclusive per HAL `build.rs`). The
+12-crate distribution closure, per-profile graph/payload parity evidence,
+and the publish bill of materials live in
 `releases/esp-hal-p4-pre-v3/1.1.0-p4v13.1/`.
 
 Reproducible smoke test from crates.io (fresh homes, no checkout leakage):
