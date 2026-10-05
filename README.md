@@ -167,75 +167,27 @@ This is a bounded validation block. External GPIO/UART routing and signals, abso
 
 ## Do you actually need `esp-hal-p4-pre-v3`?
 
-You probably do not.
-
-This is a compatibility build of `esp-hal` for early ESP32-P4 silicon with
-chip revision **below 3.0**, including the v1.3 development kits that escaped
-into the world before the production silicon arrived.
-
-First, check what chip you actually have with Espressif's own tool:
+Probably not. This is a compatibility build of
+[esp-hal](https://github.com/esp-rs/esp-hal) for pre-v3 ESP32-P4 silicon
+(chip revision below 3.0). Check yours with Espressif's own tool:
 
 ```sh
 espflash board-info
 ```
 
-Look for the ESP32-P4 chip revision.
-
-### Revision 3.0 or newer?
-
-Congratulations. Your chip is normal. Use upstream `esp-hal`:
-
-```toml
-[dependencies]
-esp-hal = { version = "...", features = ["esp32p4"] }
-```
-
-You do not need this compatibility package.
-
-### Revision below 3.0?
-
-My condolences. You own preliminary ESP32-P4 silicon.
-Fortunately, that is exactly what this package is for:
-
-```toml
-[dependencies]
-esp-hal = {
-    package = "esp-hal-p4-pre-v3",
-    version = "=1.1.0-p4v13.1",
-    features = ["esp32p4"]
-}
-```
-
-Your Rust code remains unchanged:
-
-```rust
-use esp_hal::{Config, clock::CpuClock};
-```
-
 ```text
 ESP32-P4
    │
-   ├── revision >= 3.0
-   │      └── use upstream esp-hal
+   ├── revision >= 3.0 → use upstream esp-hal, you don't need this crate
    │
-   └── revision < 3.0
-          └── use esp-hal-p4-pre-v3
+   └── revision < 3.0 → use esp-hal-p4-pre-v3:
+
+esp-hal = { package = "esp-hal-p4-pre-v3", version = "=1.1.0-p4v13.1", features = ["esp32p4"] }
 ```
 
-That is the entire decision tree.
-
-### Why does this exist?
-
-ESP32-P4 silicon before revision 3.0 differs from production revisions in
-several low-level areas. Code intended for production P4 silicon cannot
-simply be assumed to work on these earlier chips.
-
-This distribution preserves the compatible `esp-hal` source graph required
-by the tested pre-v3 configuration and publishes it as normal Cargo
-packages. It has been validated on an ESP32-P4 v1.3 board for the tested
-paths, including boot, interrupts, synchronization, UART, ROM calls, and
-dual-core execution. It is not a claim that every peripheral combination
-on preliminary silicon has been validated.
+Rust code stays the same (`use esp_hal::...`). Validated on v1.3 silicon
+for the tested paths (boot, interrupts, locks, UART, ROM, dual-core);
+not every peripheral combination is validated.
 
 ### Technical details
 
