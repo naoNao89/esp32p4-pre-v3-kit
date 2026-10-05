@@ -182,7 +182,7 @@ ESP32-P4
    │
    └── revision < 3.0 → use esp-hal-p4-pre-v3:
 
-esp-hal = { package = "esp-hal-p4-pre-v3", version = "=1.1.0-p4v13.1", features = ["esp32p4"] }
+esp-hal = { package = "esp-hal-p4-pre-v3", version = "=1.1.0-p4v13.2", features = ["esp32p4"] }
 ```
 
 Rust code stays the same (`use esp_hal::...`). Validated on v1.3 silicon
