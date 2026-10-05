@@ -9,6 +9,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tempfile::Builder;
 
+mod distribution;
+
 const MANIFEST_JSON: &str = include_str!("../patches/manifest.json");
 const PATCH_BYTES: &[u8] = include_bytes!("../patches/esp32p4-pre-v3.patch");
 
@@ -261,9 +263,12 @@ pub fn prepare(destination: &Path, manifest_json: &str, patch_bytes: &[u8]) -> R
     Ok(())
 }
 fn print_help() {
-    println!("usage: cargo esp32p4-pre-v3 <prepare DEST|--help|-h|--version|-V>");
+    println!(
+        "usage: cargo esp32p4-pre-v3 <prepare DEST|distribute PREPARED METADATA_JSON DEST|--help|-h|--version|-V>"
+    );
     println!();
     println!("Prepare the pinned, patched upstream HAL checkout for a consumer workspace.");
+    println!("Distribute a validated prepared graph as isolated registry package inputs.");
 }
 
 pub fn run_cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> ExitCode {
@@ -274,7 +279,9 @@ pub fn run_cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> ExitCode {
     }
 
     let Some(command) = first_arg else {
-        eprintln!("usage: cargo esp32p4-pre-v3 <prepare DEST|--help|-h|--version|-V>");
+        eprintln!(
+            "usage: cargo esp32p4-pre-v3 <prepare DEST|distribute PREPARED METADATA_JSON DEST|--help|-h|--version|-V>"
+        );
         return ExitCode::from(2);
     };
 
@@ -284,6 +291,32 @@ pub fn run_cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> ExitCode {
     } else if command == "--version" || command == "-V" {
         println!("cargo-esp32p4-pre-v3 {}", env!("CARGO_PKG_VERSION"));
         ExitCode::SUCCESS
+    } else if command == "distribute" {
+        let (Some(prepared), Some(metadata), Some(destination)) =
+            (args.next(), args.next(), args.next())
+        else {
+            eprintln!("usage: cargo esp32p4-pre-v3 distribute PREPARED METADATA_JSON DEST");
+            return ExitCode::from(2);
+        };
+        if args.next().is_some()
+            || [&prepared, &metadata, &destination]
+                .iter()
+                .any(|arg| arg.as_encoded_bytes().starts_with(b"-"))
+        {
+            eprintln!("usage: cargo esp32p4-pre-v3 distribute PREPARED METADATA_JSON DEST");
+            return ExitCode::from(2);
+        }
+        match distribution::distribute(
+            Path::new(&prepared),
+            Path::new(&metadata),
+            Path::new(&destination),
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        }
     } else if command == "prepare" {
         let mut dest: Option<std::ffi::OsString> = None;
         let mut positional_only = false;
@@ -334,7 +367,9 @@ pub fn run_cli(mut args: impl Iterator<Item = std::ffi::OsString>) -> ExitCode {
         }
     } else {
         eprintln!("unknown command: {}", command.to_string_lossy());
-        eprintln!("usage: cargo esp32p4-pre-v3 <prepare DEST|--help|-h|--version|-V>");
+        eprintln!(
+            "usage: cargo esp32p4-pre-v3 <prepare DEST|distribute PREPARED METADATA_JSON DEST|--help|-h|--version|-V>"
+        );
         ExitCode::from(2)
     }
 }
