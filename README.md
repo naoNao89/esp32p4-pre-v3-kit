@@ -52,7 +52,7 @@ Prerequisites: Rust 1.95+, Git. Layout:
 ```text
 work/
 ├── app/
-└── prepared/   # created by the command
+└── prepared/   # created when you run prepare below, not in this repo
 ```
 
 ```sh
