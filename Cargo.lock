@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-esp32p4-pre-v3"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "regex",
  "same-file",
