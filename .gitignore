@@ -1,6 +1,20 @@
 # Generated build artifacts.
 /target/
 /prepared/
+# Ad-hoc compiled scratch binaries at repo root (no extension).
+/cargo-testargs
+/test-args
+/test-btreemap-get
+/test-btreemap-get2
+/test-cli
+/test-cli-args
+/test-distribute-call
+/test_join_dot
+/test_join_dotdot
+/test_filename
+/test_cargo_path
+/test_rename
+/test-osstr
 
 # Python bytecode caches.
 __pycache__/
