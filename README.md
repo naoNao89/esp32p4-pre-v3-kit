@@ -60,7 +60,7 @@ cargo install cargo-esp32p4-pre-v3
 cd work && cargo esp32p4-pre-v3 prepare ./prepared
 ```
 
-This fetches upstream `esp-hal@e02f3613e9f9ba1ce00070eb387e3bf4fde2267b`, verifies the patch checksum, applies it to `./prepared/upstream`, and writes `./prepared/Cargo.patch.toml` (absolute path entries). Destination must not exist; nothing is overwritten. Maintainer-only release cut:
+Output goes to `./prepared/upstream` plus `./prepared/Cargo.patch.toml` (absolute paths; destination must not exist). Maintainer-only:
 
 ```sh
 cargo esp32p4-pre-v3 distribute PREPARED METADATA_JSON DEST
