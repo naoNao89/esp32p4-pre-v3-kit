@@ -87,16 +87,7 @@ esp32p4 = ["esp-backtrace/esp32p4", "esp-bootloader-esp-idf/esp32p4", "esp-hal/e
 
 ## Checks
 
-```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --locked
-cargo test --test consumer -- --ignored --test-threads=1
-cargo package --list
-cargo publish --dry-run
-```
-
-Consumer tests are ignored by default (need RISC-V target, network, `llvm-objdump` via `llvm-tools-preview`). Append `--allow-dirty` to `package`/`publish` when testing with uncommitted changes.
+Checks run in CI — see `.github/workflows/ci.yml` (fmt, clippy, host + consumer tests, release build, package/publish dry-run).
 
 ## Scope and limits
 
