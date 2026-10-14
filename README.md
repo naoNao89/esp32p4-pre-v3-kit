@@ -39,6 +39,8 @@ rustflags = ["-C", "link-arg=-Tlinkall.x", "-C", "force-frame-pointers"]
 
 Rules: `MIN_CHIP_REVISION` unset defaults to `300` (v3+) and will not run on pre-v3. Pre-v3 and v3+ binaries are incompatible across the v3 boundary (pre-v3 uses a non-standard CLIC; v3+ emits CSR `0x347` which traps on pre-v3) — no fallback, do not flash the wrong family. Use a separate `target-dir` per revision; Cargo does not always invalidate on env change. Do not force `linker = "rust-lld"`.
 
+Minimal copy-paste firmware: [`examples/minimal-p4-rev103`](examples/minimal-p4-rev103) (rev103 build verified from crates.io, no CSR `0x347` in image).
+
 ## Published packages
 
 Rev 3.0+ uses upstream `esp-hal`, pre-v3 uses [`esp-hal-p4-pre-v3`](https://crates.io/crates/esp-hal-p4-pre-v3) ([docs](https://docs.rs/esp-hal-p4-pre-v3)). Tool crate: [`cargo-esp32p4-pre-v3`](https://crates.io/crates/cargo-esp32p4-pre-v3). Feature profiles: `esp32p4`, `critical-section` + `unstable`, `log-04`, `defmt`, and their maximal valid combination (`log-04` and `defmt` are mutually exclusive).

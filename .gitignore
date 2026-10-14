@@ -33,3 +33,7 @@ __pycache__/
 .mcp.json
 .cursor/
 
+# Example crate build outputs.
+examples/*/target/
+examples/*/Cargo.lock
+
