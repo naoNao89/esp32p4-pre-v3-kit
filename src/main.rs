@@ -5,33 +5,10 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tempfile::Builder;
 
-mod distribution;
-
-const MANIFEST_JSON: &str = include_str!("../patches/manifest.json");
-const PATCH_BYTES: &[u8] = include_bytes!("../patches/esp32p4-pre-v3.patch");
-
-#[derive(Deserialize, Debug)]
-struct ManifestUpstream {
-    repository: String,
-    revision: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct ManifestPatch {
-    #[serde(rename = "path")]
-    _path: String,
-    sha256: String,
-}
-#[derive(Deserialize, Debug)]
-struct Manifest {
-    upstream: ManifestUpstream,
-    patch: ManifestPatch,
-    cargo_patches: Vec<String>,
-}
+use cargo_esp32p4_pre_v3::{MANIFEST_JSON, Manifest, PATCH_BYTES, distribution};
 
 fn run_command(step: &str, cmd: &mut Command) -> Result<String, String> {
     let result = cmd
