@@ -39,7 +39,9 @@ Rules: `MIN_CHIP_REVISION` unset defaults to `300` (v3+) and will not run on pre
 
 ## Published packages
 
-Rev 3.0+ uses upstream `esp-hal`, pre-v3 uses [`esp-hal-p4-pre-v3`](https://crates.io/crates/esp-hal-p4-pre-v3) ([docs](https://docs.rs/esp-hal-p4-pre-v3)). Tool crate: [`cargo-esp32p4-pre-v3`](https://crates.io/crates/cargo-esp32p4-pre-v3). Feature profiles: `esp32p4`, `critical-section` + `unstable`, `log-04`, `defmt`, and their maximal valid combination (`log-04` and `defmt` are mutually exclusive). The 12-crate closure and per-version BOMs live in `releases/esp-hal-p4-pre-v3/`.
+Rev 3.0+ uses upstream `esp-hal`, pre-v3 uses [`esp-hal-p4-pre-v3`](https://crates.io/crates/esp-hal-p4-pre-v3) ([docs](https://docs.rs/esp-hal-p4-pre-v3)). Tool crate: [`cargo-esp32p4-pre-v3`](https://crates.io/crates/cargo-esp32p4-pre-v3). Feature profiles: `esp32p4`, `critical-section` + `unstable`, `log-04`, `defmt`, and their maximal valid combination (`log-04` and `defmt` are mutually exclusive).
+
+Release history is the immutable version list on crates.io plus git tags.
 
 ## Advanced: rebuild / audit from source
 
