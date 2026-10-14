@@ -1,8 +1,10 @@
-# ESP32-P4 pre-v3 source patch kit
+# ESP32-P4 v1.3 Rust support for esp-hal (pre-v3 compatibility)
+
 [![cargo-esp32p4-pre-v3 on crates.io](https://img.shields.io/crates/v/cargo-esp32p4-pre-v3)](https://crates.io/crates/cargo-esp32p4-pre-v3) [![esp-hal-p4-pre-v3 on crates.io](https://img.shields.io/crates/v/esp-hal-p4-pre-v3)](https://crates.io/crates/esp-hal-p4-pre-v3) [![docs.rs](https://img.shields.io/docsrs/cargo-esp32p4-pre-v3)](https://docs.rs/cargo-esp32p4-pre-v3)
 
-Source patch + preparation tool for pre-v3 ESP32-P4 silicon (rev < 3.0).
-Most users never run the tool — use the published package below with the normal `esp-hal` API.
+Using an ESP32-P4 revision 1.3 board with Rust and upstream `esp-hal` doesn't boot, traps with an illegal instruction, or misbehaves on interrupts, clocks, or UART? Upstream `esp-hal` supports ESP32-P4 revision 3.0 and newer only — revision 1.3 (and any pre-v3 silicon) is not officially supported and not on the upstream roadmap.
+
+This project provides a community-maintained compatibility build for pre-v3 ESP32-P4 silicon, including revision 1.3, keeping the familiar `esp-hal` API. Most users never run the patch tool below — just depend on the published package and build with the revision flag. See [troubleshooting](ESP32-P4-V1.3-TROUBLESHOOTING.md) for symptoms, causes, and what is (and isn't) validated.
 
 ## Quick start
 
@@ -42,6 +44,18 @@ Rules: `MIN_CHIP_REVISION` unset defaults to `300` (v3+) and will not run on pre
 Rev 3.0+ uses upstream `esp-hal`, pre-v3 uses [`esp-hal-p4-pre-v3`](https://crates.io/crates/esp-hal-p4-pre-v3) ([docs](https://docs.rs/esp-hal-p4-pre-v3)). Tool crate: [`cargo-esp32p4-pre-v3`](https://crates.io/crates/cargo-esp32p4-pre-v3). Feature profiles: `esp32p4`, `critical-section` + `unstable`, `log-04`, `defmt`, and their maximal valid combination (`log-04` and `defmt` are mutually exclusive).
 
 Release history is the immutable version list on crates.io plus git tags.
+
+## FAQ
+
+**Does upstream `esp-hal` support the ESP32-P4 v1.3?** No. Upstream supports revision 3.0 and newer; pre-v3 support is not on their roadmap (see [esp-rs/esp-hal#3962](https://github.com/esp-rs/esp-hal/issues/3962)). This repo is the community compatibility path.
+
+**How do I know my revision?** `espflash board-info`. Revision 1.3 reports `103` (`major * 100 + minor`).
+
+**Can I use upstream `esp-hal` with `MIN_CHIP_REVISION=103`?** No — upstream has no pre-v3 code paths. You need `esp-hal-p4-pre-v3` plus the revision flag.
+
+**Will a v3+ binary run on my v1.3 board?** No. It emits CSR `0x347` (CLIC threshold) instructions that trap as illegal on pre-v3, and the reverse mismatches the memory-mapped CLIC. No fallback — always match the binary to the silicon.
+
+**Is this official or fully certified?** Neither. Validated on one v1.3 board (boot, timer IRQs, locks, internal UART loopback, dual-core stress, selected ROM checks); external routing, PSRAM, LP_UART, power/reset and thermal behavior are unvalidated.
 
 ## Advanced: rebuild / audit from source
 
