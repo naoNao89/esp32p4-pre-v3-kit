@@ -42,6 +42,7 @@ Rules: `MIN_CHIP_REVISION` unset defaults to `300` (v3+) and will not run on pre
 Rev 3.0+ uses upstream `esp-hal`, pre-v3 uses [`esp-hal-p4-pre-v3`](https://crates.io/crates/esp-hal-p4-pre-v3) ([docs](https://docs.rs/esp-hal-p4-pre-v3)). Tool crate: [`cargo-esp32p4-pre-v3`](https://crates.io/crates/cargo-esp32p4-pre-v3). Feature profiles: `esp32p4`, `critical-section` + `unstable`, `log-04`, `defmt`, and their maximal valid combination (`log-04` and `defmt` are mutually exclusive). The 12-crate closure and per-version BOMs live in `releases/esp-hal-p4-pre-v3/`.
 
 ## Advanced: rebuild / audit from source
+
 > Registry users stop here. Everything below is ONLY for the `prepare` path (local rebuild/audit) — skip it if you depend on `esp-hal-p4-pre-v3` from crates.io.
 
 Prerequisites: Rust 1.95+, Git. Layout:
