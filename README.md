@@ -17,6 +17,7 @@ espflash board-info
 [dependencies]
 esp-hal = { package = "esp-hal-p4-pre-v3", version = "=1.1.0-p4v13.2", features = ["esp32p4"] }
 ```
+> Only add `esp-hal-p4-pre-v3`. The other 11 `*-p4-pre-v3` crates on crates.io are transitive lockstep deps pulled in automatically — do not add them manually or mix versions.
 
 Then build exactly as below (revision variable, target, linker flags).
 The rest of this document describes the source-preparation path, which you
