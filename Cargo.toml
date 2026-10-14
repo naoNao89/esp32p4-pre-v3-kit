@@ -18,6 +18,7 @@ include = [
     "/patches/manifest.json",
     "/patches/esp32p4-pre-v3.patch",
     "/README.md",
+    "/ESP32-P4-V1.3-TROUBLESHOOTING.md",
     "/PROVENANCE.md",
     "/LICENSE-MIT",
     "/LICENSE-APACHE",
