@@ -40,3 +40,8 @@ jobs:
 
       - name: Publish Dry-Run
         run: cargo publish --dry-run --locked
+
+      - name: README version freshness
+        run: |
+          latest=$(curl -s -H 'User-Agent: ci' https://crates.io/api/v1/crates/esp-hal-p4-pre-v3 | jq -r '.crate.max_version')
+          grep -q "version = \"=$latest\"" README.md || { echo "README pins stale version (crates.io latest: $latest)"; exit 1; }
